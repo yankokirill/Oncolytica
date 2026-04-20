@@ -1,0 +1,9 @@
+[package]
+name = "tumor_sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.15.3"
+bytemuck = { version = "1.19", features = ["derive"] }
+fastrand = "2.4.1"

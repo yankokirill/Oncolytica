@@ -1,0 +1,29 @@
+// 1. ОБЪЯВЛЯЕМ ВСЕ ЯДРА
+#pragma kernel SpatialGrid_Clear
+#pragma kernel SpatialGrid_Insert_Interaction
+#pragma kernel SpatialGrid_Insert_Field
+
+#pragma kernel Kernel_InitField
+#pragma kernel Kernel_InitEnvironment
+
+#pragma kernel Kernel_ApplyReaction
+#pragma kernel Kernel_DiffusionSolver
+
+#pragma kernel Kernel_Interaction
+#pragma kernel Kernel_CellUpdate
+#pragma kernel Kernel_Division
+
+#pragma kernel Kernel_ClearMetrics
+#pragma kernel Kernel_CollectMetrics
+#pragma kernel Kernel_FinalizeMetrics
+
+// 2. ПОДКЛЮЧАЕМ ДАННЫЕ И УТИЛИТЫ
+#include "Includes/CoreData.hlsl"
+#include "Includes/Utils.hlsl"
+
+// 3. ПОДКЛЮЧАЕМ ЛОГИКУ (Имплементация ядер)
+#include "Includes/SpatialGrid.hlsl"
+#include "Includes/Environment.hlsl"
+#include "Includes/Fields.hlsl"
+#include "Includes/Rules.hlsl"
+#include "Includes/CollectMetrics.hlsl"
