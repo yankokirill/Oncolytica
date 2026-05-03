@@ -1,17 +1,17 @@
 """GPU Morton-sort test using high-level Engine API with fake Simulation."""
-import math, random, pytest
-from oncolytica.core._simulation import Simulation
-from oncolytica.core._types import TissueData, ChemistryData, CellData, MetricsData, vec3
-from oncolytica.core._geometry import get_tissue_voxel_key, voxel_table_size
-from oncolytica.core._engine import Engine
+import random, pytest
+from oncolytica.core.utils._types import Simulation, Tissue, Chemistry, Cell, Metrics, Params, vec3
+from oncolytica.core.runtime._geometry import get_tissue_voxel_key, voxel_table_size
+from oncolytica.core.runtime._engine import Engine
 
 # ── Mock data classes (must inherit from base types for validation) ──
-class Cell(CellData): pos: vec3; id: int
-class Tissue(TissueData): pad: int = 0
-class Chemistry(ChemistryData): pad: int = 0
-class Metrics(MetricsData): pad: int = 0
+class MockCell(Cell): pos: vec3; id: int
+class MockTissue(Tissue): pad: int = 0
+class MockChemistry(Chemistry): pad: int = 0
+class MockMetrics(Metrics): pad: int = 0
+class MockParams(Params): pass
 
-class FakeSim(Simulation[Tissue, Chemistry, Cell, Metrics]):
+class FakeSim(Simulation[MockTissue, MockChemistry, MockCell, MockMetrics, MockParams]):
     pass
 
 def test_gpu_sort_highlevel():
@@ -30,7 +30,7 @@ def test_gpu_sort_highlevel():
     ref = {}
     for i in range(N):
         p = [random.uniform(0, GDIM[j]*VS*0.99) for j in range(3)]
-        c = Cell()
+        c = MockCell()
         c.pos, c.id = vec3(*p), i
         eng.cells.add(c)
         coord = tuple(int(x/VS) for x in p)

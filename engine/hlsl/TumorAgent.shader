@@ -2,7 +2,7 @@ Shader "TumorABM/TumorAgent"
 {
     Properties
     {
-        _Scale             ("Cell Scale",          Float)  = 0.45
+        _Scale             ("MockCell Scale",          Float)  = 0.45
         _NecroticDecayTime ("Necrotic Decay Time", Float)  = 50.0
         [Toggle] _EnableClipping ("Enable Slicing",Float)  = 0
         _ClipPlaneOrigin   ("Clip Plane Origin",   Vector) = (0,0,0,0)

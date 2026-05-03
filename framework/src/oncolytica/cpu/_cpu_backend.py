@@ -63,7 +63,7 @@ class CPUBackend:
                         rule(voxel)
 
         if collect_metrics and engine._metric_rules and engine._metrics is not None:
-            engine._metrics.clear()
+            engine._metrics._clear()
             for rule in engine._metric_rules:
                 container = engine._resolve_container_for(rule)
                 for item in container:

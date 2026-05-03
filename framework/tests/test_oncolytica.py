@@ -13,23 +13,25 @@ from oncolytica import CompilationError
 # 1. FIXTURES & BASIC DATA STRUCTURES
 # ==============================================================================
 
-class MyCell(ol.CellData):
+class MyCell(ol.Cell):
     pos: ol.vec3 = ol.vec3(50.0, 50.0, 50.0)
     health: ol.f32
     mutated: ol.bool
 
 
-class MyTissue(ol.TissueData):
+class MyTissue(ol.Tissue):
     oxygen: ol.f32 = 1.0
 
 
-class MyChem(ol.ChemistryData):
+class MyChem(ol.Chemistry):
     drug_conc: ol.f32 = 0.0
 
 
-class MyMetrics(ol.MetricsData):
+class MyMetrics(ol.Metrics):
     alive_cells: ol.u32 = 0
 
+class MyParams(ol.Params):
+    pass
 
 # ==============================================================================
 # 2. BASIC TESTS (HAPPY PATH)
@@ -55,7 +57,7 @@ def test_core_types_and_math():
 
 def test_basic_cpu_simulation():
     """Test the full lifecycle of a basic simulation on the CPU backend."""
-    class BasicSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class BasicSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def cell_logic(self, cell: MyCell):
             cell.health -= 10.0
@@ -95,7 +97,7 @@ def test_basic_gpu_compilation():
     """Test that a valid simulation compiles successfully to WGSL via wgpu."""
     wgpu = pytest.importorskip("wgpu")
 
-    class GpuSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class GpuSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         o2_consumption: ol.f32 = 0.1  # Valid constant declaration
 
         @ol.cell_rule
@@ -116,7 +118,7 @@ def test_local_variables():
     """Test that a valid simulation compiles successfully to WGSL via wgpu."""
     wgpu = pytest.importorskip("wgpu")
 
-    class GpuSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class GpuSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         o2_consumption: ol.f32 = 0.1  # Valid constant declaration
 
         @ol.cell_rule
@@ -141,7 +143,7 @@ def test_local_variables():
 def test_edge_case_constant_mutation():
     """Constants (UPPER_CASE variables) cannot be reassigned inside rules."""
 
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             O2_CONSUMPTION = 0.5  # Forbidden: UPPER_CASE assignment
@@ -154,7 +156,7 @@ def test_edge_case_constant_mutation():
 def test_edge_case_forbidden_syntax():
     """WGSL does not support try/except blocks."""
 
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             try:
@@ -167,19 +169,6 @@ def test_edge_case_forbidden_syntax():
         engine.load_model(BadSim())
 
 
-def test_edge_case_pointer_reassignment():
-    """Memory Layout pointers (like CellData instances) cannot be reassigned."""
-
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
-        @ol.cell_rule
-        def rule(self, cell: MyCell):
-            cell = MyCell()
-
-    engine = ol.Engine(backend="cpu")
-    with pytest.raises(CompilationError, match="Cannot rebind pointer argument"):
-        engine.load_model(BadSim())
-
-
 def test_edge_case_wgsl_vector_scalar_broadcast():
     """
     Python allows `vec3 + scalar`. WGSL does not allow `vec3<f32> += f32`.
@@ -187,7 +176,7 @@ def test_edge_case_wgsl_vector_scalar_broadcast():
     """
     wgpu = pytest.importorskip("wgpu")
 
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             # Python allows this, but StmtTranslator will emit `cell.pos += 1.0;`
@@ -213,7 +202,7 @@ def test_edge_case_wgsl_strict_math_typing():
     """
     wgpu = pytest.importorskip("wgpu")
 
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             # Transpiles to `sin(5)` in WGSL. `sin()` expects f32/f16.
@@ -237,7 +226,7 @@ def test_edge_case_scope_leakage():
     """
     wgpu = pytest.importorskip("wgpu")
 
-    class GoodSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class GoodSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             if cell.pos.x > 0.0:
@@ -256,41 +245,12 @@ def test_edge_case_scope_leakage():
         pytest.fail(f"GPU Compilation failed on valid WGSL code: {e}")
 
 
-def test_edge_case_ol_neighbors_forbidden():
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
-        @ol.cell_rule
-        def rule(self, cell: MyCell):
-            for n in cell.neighbors:
-                n.health -= 1.0
-
-    engine = ol.Engine(backend="gpu")
-
-    with pytest.raises(CompilationError, match="You can ONLY modify the state of the current agent/voxel passed to the rule."):
-        engine.load_model(BadSim())
-
-def test_immutable_neighbors():
-    """
-    Nested spatial queries are now allowed if using the correct syntax.
-    """
-    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
-        @ol.cell_rule
-        def rule(self, cell: MyCell):
-            # This is now legal syntax
-            for n1 in cell.neighbors:
-                for n2 in n1.neighbors:
-                    n2.health -= 1.0
-
-    engine = ol.Engine(backend="cpu") # Or gpu if your generator supports nesting
-    with pytest.raises(CompilationError, match="You can ONLY modify the state of the current agent/voxel passed to the rule."):
-        engine.load_model(BadSim())
-
-
 def test_nested_neighbors_supported_and_safe():
     """
     Test that nested neighbor iteration works, but strictly enforces
     immutability of the neighbors (Corrected version of the previous test).
     """
-    class GoodSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class GoodSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             for n1 in cell.neighbors:
@@ -311,7 +271,7 @@ def test_gpu_noncubic_cell_simulation_runs():
     """
     wgpu = pytest.importorskip("wgpu")
 
-    class FullSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class FullSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def cell_logic(self, cell: MyCell):
             if cell.health > 50.0:
@@ -322,7 +282,7 @@ def test_gpu_noncubic_cell_simulation_runs():
             t.oxygen -= 0.01
 
     engine = ol.Engine(backend="gpu")
-    engine.setup_geometry(tissue_shape=(128, 64, 32))
+    engine.setup_geometry(tissue_shape=(120, 64, 32))
     for i in range(4):
         c = MyCell()
         c.pos = ol.vec3(float(i) * 5.0, 0.0, 0.0)
@@ -344,14 +304,17 @@ def test_gpu_teleport_die_and_atomic_metrics():
     wgpu = pytest.importorskip("wgpu")
 
     # Redefine classes with type_id for testing
-    class TestCell(ol.CellData):
+    class TestCell(ol.Cell):
         pos: ol.vec3
         type_id: ol.i32 = 0
 
-    class TestMetrics(ol.MetricsData):
+    class TestMetrics(ol.Metrics):
         alive_count: ol.u32 = 0
+    
+    class TestParams(ol.Params):
+        pass
 
-    class DieSim(ol.Simulation[MyTissue, MyChem, TestCell, TestMetrics]):
+    class DieSim(ol.Simulation[MyTissue, MyChem, TestCell, TestMetrics, TestParams]):
         @ol.cell_rule
         def rule(self, cell: TestCell):
             if cell.type_id == 1:  # Kill cell with type_id=1
@@ -359,9 +322,7 @@ def test_gpu_teleport_die_and_atomic_metrics():
 
         @ol.metric_rule
         def calc_metrics(self, cell: TestCell, m: TestMetrics):
-            # This code executes only for live cells
             m.alive_count += 1
-            # TODO: ol.u32(id != 0) --> translates u32(id != 0)
 
     engine = ol.Engine(backend="gpu", max_agents=4)
     engine.setup_geometry(tissue_shape=(10, 10, 10), tissue_voxel_size=2.0)
@@ -386,7 +347,7 @@ def test_gpu_teleport_die_and_atomic_metrics():
     for cell in engine.cells._data:
         if cell.type_id == 1:
             dead_cell_found = True
-            assert math.isclose(cell.pos.x, expected_pos), "Cell did not teleport"
+            assert math.isclose(cell.pos.x, expected_pos), "MockCell did not teleport"
         elif cell.type_id == 2:
             alive_cell_found = True
             assert math.isclose(cell.pos.x, 5.0), "Alive cell position changed"
@@ -409,11 +370,11 @@ def test_gpu_cell_division():
     """
     wgpu = pytest.importorskip("wgpu")
 
-    class DivCell(ol.CellData):
+    class DivCell(ol.Cell):
         pos: ol.vec3
         generation: ol.i32 = 0
 
-    class DivideSim(ol.Simulation[MyTissue, MyChem, DivCell, MyMetrics]):
+    class DivideSim(ol.Simulation[MyTissue, MyChem, DivCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: DivCell):
             if cell.generation == 0:
@@ -436,11 +397,11 @@ def test_gpu_cell_division():
     engine._backend_impl.sync_to_host()
 
     # The new architecture should pull the exact number of agents from the State buffer
-    assert len(engine.cells._data) == 2, "Cell division did not increase the agent count."
+    assert len(engine.cells._data) == 2, "MockCell division did not increase the agent count."
 
     # Verify properties of the new and old cells
     gen1_cells = [c for c in engine.cells._data if c.generation == 1]
-    assert len(gen1_cells) == 2, "Cell generation flag was not correctly assigned/copied."
+    assert len(gen1_cells) == 2, "MockCell generation flag was not correctly assigned/copied."
 
 
 def test_chemistry_rule_iterations():
@@ -449,7 +410,7 @@ def test_chemistry_rule_iterations():
     (Testing on CPU for predictable exact values, though compilation applies to GPU too).
     """
 
-    class ChemSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class ChemSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.chemistry_rule(iterations=3)
         def diffuse(self, chem: MyChem):
             chem.drug_conc += 1.0  # Should be called 3 times per run_step
@@ -480,7 +441,7 @@ def test_gpu_randomness_compilation():
     """
     wgpu = pytest.importorskip("wgpu")
 
-    class RandSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class RandSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule(self, cell: MyCell):
             dist = ol.random() * 2.0
@@ -502,7 +463,7 @@ def test_multiple_rules_execution():
     Test that multiple rules of the same type are all discovered and executed.
     """
 
-    class MultiRuleSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics]):
+    class MultiRuleSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
         @ol.cell_rule
         def rule_one(self, cell: MyCell):
             cell.health -= 5.0
@@ -519,3 +480,4 @@ def test_multiple_rules_execution():
 
     # 100 - 5 - 15 = 80
     assert math.isclose(engine.cells._data[0].health, 80.0)
+

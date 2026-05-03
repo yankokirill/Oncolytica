@@ -6,43 +6,44 @@ Unified CPU & GPU (WebGPU/WGSL) Backends · v2.0
 from __future__ import annotations
 
 # ── Primitive type aliases ────────────────────────────────────────────────────
-from oncolytica.core._types import f32, f64, i32, i64, u32, u64, bool
+from oncolytica.core.utils._types import f32, i32, u32, bool, Simulation
 
 # ── Core types & Data-layout base classes ─────────────────────────────────────
-from oncolytica.core._types import (
+from oncolytica.core.utils._types import (
     vec3,
+    ivec3,
     BaseData,
-    TissueData,
-    ChemistryData,
-    CellData,
-    MetricsData,
+    Tissue,
+    Chemistry,
+    Cell,
+    Metrics,
+    Params,
 )
 
-from oncolytica.core._types import random, random_dir
+from oncolytica.core.utils._types import random, random_dir
 
 # ── Math namespace ────────────────────────────────────────────────────────────
-import oncolytica.core._math as math
+import oncolytica.core.utils._math as math
 
 # ── Data containers ───────────────────────────────────────────────────────────
-from oncolytica.cpu._containers import Grid, AgentList
+from oncolytica.core.utils._containers import Grid, AgentList
 
 # ── Rule decorators ───────────────────────────────────────────────────────────
 from oncolytica.cpu._decorators import tissue_rule, chemistry_rule, cell_rule, metric_rule
 
 # ── Simulation & Engine ───────────────────────────────────────────────────────
-from oncolytica.core._simulation import Simulation
-from oncolytica.core._engine import Engine
+from oncolytica.core.runtime._engine import Engine
 
 # ── GPU Compiler Exceptions ───────────────────────────────────────────────────
-from oncolytica.core._errors import CompilationError
+from oncolytica.core.utils._errors import CompilationError
 
 __all__ = [
     # primitives
-    "f32", "f64", "i32", "i64", "u32", "u64", "bool",
+    "f32", "i32", "u32", "bool",
     # core types
     "vec3",
     # data layouts
-    "BaseData", "TissueData", "ChemistryData", "CellData", "MetricsData",
+    "BaseData", "Tissue", "Chemistry", "Cell", "Metrics",
     # math
     "math",
     # containers
