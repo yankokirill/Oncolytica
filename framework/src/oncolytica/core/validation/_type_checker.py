@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, Dict, FrozenSet, List, Optional, TypeVar, get_type_hints
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, FrozenSet, Generator, List, Optional, TypeVar, get_type_hints
 
 from oncolytica.core.utils._math import _INTRINSIC_FUNCTIONS, _INTRINSIC_ARG_TYPES
 from oncolytica.core.utils._types import (
@@ -42,10 +45,12 @@ _BUILTIN_NAMES: frozenset = frozenset({"self", "ol", "range", "True", "False", "
 _VEC3_COMPONENT_TYPE: Dict[Any, Any] = {vec3: f32, ivec3: i32}
 _VEC_ATTRS: FrozenSet[str] = frozenset({"x", "y", "z"})
 
-# Built-in self.X() grid-getter calls — resolved by special-case logic,
-# not via method_return_hints.
-_GRID_GETTERS: frozenset = frozenset({"tissue_at", "chemistry_at"})
-_FRAMEWORK_SKIP_METHODS = frozenset({"copy", "copy_from"})
+# Maps built-in self.X() grid-getter names to the base domain class they return.
+# Adding a new getter = one new entry here, no code changes elsewhere.
+_GRID_GETTER_BASE: Dict[str, Any] = {
+    "tissue_at":    Tissue,
+    "chemistry_at": Chemistry,
+}
 
 def _types_compatible(a: Any, b: Any) -> bool:
     if a is b:
@@ -76,6 +81,330 @@ def _resolve_annotation_node(ann: ast.expr) -> Optional[Any]:
 
 
 # =============================================================================
+# CALL RESOLVERS  (Strategy pattern)
+# =============================================================================
+
+# Sentinel returned by a resolver that does not claim a call.
+# Using a dedicated object avoids ambiguity with a legitimate None return type
+# (void methods really do return None).
+_UNHANDLED: Any = object()
+
+
+class CallResolver(ABC):
+    """Strategy interface: resolve the return type of one category of calls.
+
+    Each subclass handles one syntactic shape of ast.Call.  Resolvers are
+    tried in order; the first one that returns anything other than _UNHANDLED
+    wins.  TypeChecker keeps a module-level list (_CALL_RESOLVERS) so adding
+    a new call form = adding a new class and one list entry.
+    """
+
+    @abstractmethod
+    def resolve(self, node: ast.Call, checker: "TypeChecker") -> Any:
+        """Return inferred type, or _UNHANDLED to defer to the next resolver."""
+
+
+class SelfMethodResolver(CallResolver):
+    """Handles ``self.method()`` — sim-class methods and grid getters."""
+
+    def resolve(self, node: ast.Call, checker: "TypeChecker") -> Any:
+        func = node.func
+        if not (isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"):
+            return _UNHANDLED
+
+        method_name = func.attr
+
+        # Grid getters: find user class whose base matches the getter's target.
+        target_base = _GRID_GETTER_BASE.get(method_name)
+        if target_base is not None:
+            return next(
+                (u for u, b in checker.ctx.memory_base_map.items()
+                 if b is target_base),
+                None,
+            )
+
+        # Regular sim-method: look up via mangled name.
+        ret = checker.ctx.method_return_hints.get(mangle_sim(method_name))
+        if isinstance(ret, TupleType):
+            checker.ctx.collected_tuple_types.add(ret)
+        return ret
+
+
+class CopyMethodResolver(CallResolver):
+    """Handles ``obj.copy()`` with no arguments — preserves the object's type.
+
+    Applies to domain objects (Cell, Tissue, …) and vectors (vec3, ivec3).
+    vec3 is classified as primitive by _is_primitive_type, but .copy() on a
+    vector is explicitly permitted and must preserve its type.
+    Falls through (_UNHANDLED) when the receiver is a non-vector primitive so
+    that DomainMethodResolver can still attempt a lookup.
+    """
+
+    def resolve(self, node: ast.Call, checker: "TypeChecker") -> Any:
+        func = node.func
+        if not (isinstance(func, ast.Attribute)
+                and func.attr == "copy"
+                and not node.args):
+            return _UNHANDLED
+
+        obj_type = checker._infer(func.value)
+        if obj_type is not None and (
+            not checker._is_primitive_type(obj_type)
+            or obj_type in _VEC_TYPES
+        ):
+            return obj_type
+
+        return _UNHANDLED
+
+
+class DomainMethodResolver(CallResolver):
+    """Handles ``obj.method()`` on registered domain objects (Cell, Tissue, …)."""
+
+    def resolve(self, node: ast.Call, checker: "TypeChecker") -> Any:
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            return _UNHANDLED
+
+        obj_type = checker._infer(func.value)
+        if obj_type is None or checker._is_primitive_type(obj_type):
+            return _UNHANDLED
+
+        base_cls = checker.ctx.get_base_class(obj_type)
+        if base_cls is None:
+            return _UNHANDLED
+
+        mangled = mangle_domain(base_cls, func.attr)
+        return checker.ctx.method_return_hints.get(mangled)
+
+
+class IntrinsicFunctionResolver(CallResolver):
+    """Handles ``ol.math`` intrinsic function calls."""
+
+    def resolve(self, node: ast.Call, checker: "TypeChecker") -> Any:
+        func      = node.func
+        func_name = (
+            func.id   if isinstance(func, ast.Name)      else
+            func.attr if isinstance(func, ast.Attribute) else
+            None
+        )
+
+        if not func_name or func_name not in _INTRINSIC_FUNCTIONS:
+            return _UNHANDLED
+
+        checker._check_intrinsic_args(func_name, node)
+
+        # Polymorphic intrinsics mirror the type of their first argument.
+        if func_name in {"clamp", "abs", "sign", "min", "max"} and node.args:
+            arg_type = checker._infer(node.args[0])
+            if arg_type is not None:
+                return arg_type
+
+        return _INTRINSIC_FUNCTIONS[func_name]
+
+
+class ConstructorResolver(CallResolver):
+    """Handles constructor calls: primitive casts and domain-class constructors."""
+
+    def resolve(self, node: ast.Call, checker: "TypeChecker") -> Any:
+        func      = node.func
+        func_name = (
+            func.id   if isinstance(func, ast.Name)      else
+            func.attr if isinstance(func, ast.Attribute) else
+            None
+        )
+
+        if not func_name:
+            return _UNHANDLED
+
+        if func_name in _ANNOTATION_NAMES:
+            return _ANNOTATION_NAMES[func_name]
+
+        for registered_type in checker.ctx.class_field_types:
+            if getattr(registered_type, "__name__", None) == func_name:
+                return registered_type
+
+        for user_cls in checker.ctx.memory_base_map:
+            if getattr(user_cls, "__name__", None) == func_name:
+                return user_cls
+
+        return None  # recognised position, no match found → unknown constructor
+
+
+_CALL_RESOLVERS: List[CallResolver] = [
+    SelfMethodResolver(),
+    CopyMethodResolver(),
+    DomainMethodResolver(),
+    IntrinsicFunctionResolver(),
+    ConstructorResolver(),
+]
+
+
+# =============================================================================
+# INTRINSIC VALIDATORS  (Strategy pattern)
+# =============================================================================
+
+class IntrinsicValidator(ABC):
+    """Strategy interface: validate argument types for one intrinsic function."""
+
+    @abstractmethod
+    def validate(
+        self, func_name: str, node: ast.Call, checker: "TypeChecker"
+    ) -> None:
+        """Raise CompilationError if arguments are invalid."""
+
+
+class ClampValidator(IntrinsicValidator):
+    """``clamp`` is overloaded: ``(f32, f32, f32)`` or ``(vec3, vec3, vec3)``."""
+
+    def validate(
+        self, func_name: str, node: ast.Call, checker: "TypeChecker"
+    ) -> None:
+        n_given = len(node.args)
+        if n_given != 3:
+            raise CompilationError(
+                f"'clamp' expects 3 argument(s), got {n_given}.", node=node
+            )
+
+        arg_types = [checker._infer(a) for a in node.args]
+        known     = [t for t in arg_types if t is not None]
+        if not known:
+            return
+
+        first    = known[0]
+        is_vec   = first in _VEC_TYPES
+        is_float = first in _FLOAT_TYPES
+
+        if not (is_vec or is_float):
+            raise CompilationError(
+                f"'clamp' requires f32 or vec3 arguments, "
+                f"got '{type_name(first)}'. "
+                f"Hint: use a float literal or an explicit f32(...) cast.",
+                node=node,
+            )
+
+        for idx, t in enumerate(arg_types):
+            if t is None:
+                continue
+            if is_vec and t not in _VEC_TYPES:
+                raise CompilationError(
+                    f"Argument {idx + 1} of 'clamp' must be vec3 "
+                    f"(to match argument 1), got '{type_name(t)}'.",
+                    node=node,
+                )
+            if is_float and t not in _FLOAT_TYPES:
+                raise CompilationError(
+                    f"Argument {idx + 1} of 'clamp' must be f32 "
+                    f"(to match argument 1), got '{type_name(t)}'.",
+                    node=node,
+                )
+
+
+class MinMaxValidator(IntrinsicValidator):
+    """``min`` / ``max`` require two args of the same scalar category (int or float)."""
+
+    def validate(
+        self, func_name: str, node: ast.Call, checker: "TypeChecker"
+    ) -> None:
+        constraints = _INTRINSIC_ARG_TYPES.get(func_name)
+        n_expected  = len(constraints) if constraints else 2
+        n_given     = len(node.args)
+        if n_given != n_expected:
+            raise CompilationError(
+                f"'{func_name}' expects {n_expected} argument(s), got {n_given}.",
+                node=node,
+            )
+
+        t1 = checker._infer(node.args[0])
+        t2 = checker._infer(node.args[1])
+
+        for idx, t in enumerate((t1, t2)):
+            if t is not None and t not in _FLOAT_TYPES and t not in _INT_TYPES:
+                raise CompilationError(
+                    f"Argument {idx + 1} of '{func_name}' must be f32 or i32, "
+                    f"got '{type_name(t)}'.",
+                    node=node,
+                )
+
+        if t1 is not None and t2 is not None:
+            if (t1 in _FLOAT_TYPES) != (t2 in _FLOAT_TYPES):
+                raise CompilationError(
+                    f"Type mismatch: '{func_name}' arguments must have the same "
+                    f"type, got '{type_name(t1)}' and '{type_name(t2)}'.",
+                    node=node,
+                )
+
+        # Run the constraint-table check for any remaining positional rules.
+        _DEFAULT_INTRINSIC_VALIDATOR.validate(func_name, node, checker)
+
+
+class DefaultIntrinsicValidator(IntrinsicValidator):
+    """Applies the positional constraint table from ``_INTRINSIC_ARG_TYPES``."""
+
+    def validate(
+        self, func_name: str, node: ast.Call, checker: "TypeChecker"
+    ) -> None:
+        constraints = _INTRINSIC_ARG_TYPES.get(func_name)
+        if constraints is None:
+            return  # No constraints registered → accept anything.
+
+        n_expected = len(constraints)
+        n_given    = len(node.args)
+        if n_given != n_expected:
+            raise CompilationError(
+                f"'{func_name}' expects {n_expected} argument(s), got {n_given}.",
+                node=node,
+            )
+
+        for idx, (arg_node, allowed_types) in enumerate(
+            zip(node.args, constraints)
+        ):
+            arg_type = checker._infer(arg_node)
+            if arg_type is None:
+                continue
+            if arg_type not in allowed_types:
+                nice_allowed = " | ".join(
+                    type_name(t) for t in sorted(allowed_types, key=type_name)
+                )
+                raise CompilationError(
+                    f"Argument {idx + 1} of '{func_name}' must be {nice_allowed}, "
+                    f"got '{type_name(arg_type)}'. "
+                    f"Hint: use a float literal (e.g. {func_name}(5.0)) "
+                    f"or an explicit cast (e.g. {func_name}(f32(x))).",
+                    node=arg_node,
+                )
+
+
+_DEFAULT_INTRINSIC_VALIDATOR = DefaultIntrinsicValidator()
+
+_INTRINSIC_VALIDATORS: Dict[str, IntrinsicValidator] = {
+    "clamp": ClampValidator(),
+    "min":   MinMaxValidator(),
+    "max":   MinMaxValidator(),
+}
+
+
+# =============================================================================
+# METHOD SCOPE
+# =============================================================================
+
+@dataclass
+class MethodScope:
+    """Isolated mutable state for a single method being type-checked.
+
+    Replaces the three bare instance variables (_env, _current_method,
+    _return_type) that were previously saved and restored by hand.  The
+    TypeChecker holds a stack of scopes so that any exception unwinds
+    cleanly through the contextmanager, leaving the checker in a valid state.
+    """
+
+    name: str                    # mangled method name, e.g. "sim_spawn"
+    return_type: Optional[Any]   # expected return type (None = void)
+    env: Dict[str, Any] = field(default_factory=dict)  # local variable types
+
+
+# =============================================================================
 # PHASE 2 – TYPE CHECKER
 # =============================================================================
 
@@ -101,9 +430,7 @@ class TypeChecker(BaseValidator):
 
     def __init__(self) -> None:
         super().__init__()
-        self._env: Dict[str, Any] = {}
-        self._current_method: Optional[str] = None   # mangled name
-        self._return_type: Optional[Any] = None
+        self._scope: Optional[MethodScope] = None
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -115,50 +442,72 @@ class TypeChecker(BaseValidator):
 
     # ── Per-method check ──────────────────────────────────────────────────────
 
+    @contextmanager
+    def _method_scope(
+        self,
+        mangled_name: str,
+        node: ast.FunctionDef,
+    ) -> Generator[MethodScope, None, None]:
+        """Push a new MethodScope for *mangled_name*, yield it, then restore.
+
+        Using a contextmanager instead of the old manual save/restore ensures
+        that the previous scope is always reinstated even when an exception
+        propagates out of the body — no try/finally boilerplate at each call
+        site.
+        """
+        previous = self._scope
+        self._scope = MethodScope(
+            name=mangled_name,
+            return_type=self.ctx.method_return_hints.get(mangled_name),
+            env=dict(self.ctx.method_type_hints.get(mangled_name, {})),
+        )
+        try:
+            yield self._scope
+        finally:
+            self._scope = previous
+
     def _check_function(self, mangled_name: str, node: ast.FunctionDef) -> None:
-        saved = (self._env, self._current_method, self._return_type)
-
-        self._current_method = mangled_name
-        self._return_type    = self.ctx.method_return_hints.get(mangled_name)
-
-        # Build local env from parameter hints.
         # For sim-methods "self" is absent from method_type_hints (excluded in
         # ContextBuilder); for domain-methods it is present at index 0 but
         # those nodes are not in ctx.method_nodes, so this branch only ever
         # sees sim-method hints where self is correctly absent.
-        self._env = dict(self.ctx.method_type_hints.get(mangled_name, {}))
+        with self._method_scope(mangled_name, node) as scope:
+            for stmt in node.body:
+                self._check_stmt(stmt)
 
-        for stmt in node.body:
-            self._check_stmt(stmt)
+            self.ctx.symbol_table[mangled_name] = {
+                k: v for k, v in scope.env.items() if k != "self"
+            }
 
-        self.ctx.symbol_table[mangled_name] = {
-            k: v for k, v in self._env.items() if k != "self"
-        }
-        self._env, self._current_method, self._return_type = saved
-
-    # ── Statement dispatch ────────────────────────────────────────────────────
+    # ── Statement dispatch (Visitor) ─────────────────────────────────────────
 
     def _check_stmt(self, node: ast.stmt) -> None:
-        if isinstance(node, ast.Assign):
-            self._on_assign(node)
-        elif isinstance(node, ast.AnnAssign):
-            self._on_ann_assign(node)
-        elif isinstance(node, ast.AugAssign):
-            self._on_aug_assign(node)
-        elif isinstance(node, ast.Return):
-            self._on_return(node)
-        elif isinstance(node, ast.If):
-            self._infer(node.test)
-            for s in node.body:   self._check_stmt(s)
-            for s in node.orelse: self._check_stmt(s)
-        elif isinstance(node, ast.For):
-            self._on_for(node)
-        elif isinstance(node, ast.Expr):
-            self._infer(node.value)
+        """Public entry point — delegates to the visitor dispatcher."""
+        self._dispatch_stmt(node)
+
+    def _dispatch_stmt(self, node: ast.stmt) -> None:
+        """Route *node* to the matching _stmt_<ClassName> handler.
+
+        Unknown statement types (e.g. ast.Pass, ast.While) are silently
+        ignored, preserving the same behaviour as the old isinstance chain.
+        """
+        handler = getattr(self, f"_stmt_{type(node).__name__}", None)
+        if handler is not None:
+            handler(node)
+
+    # ── Statement handlers ────────────────────────────────────────────────────
+
+    def _stmt_If(self, node: ast.If) -> None:
+        self._infer(node.test)
+        for s in node.body:   self._dispatch_stmt(s)
+        for s in node.orelse: self._dispatch_stmt(s)
+
+    def _stmt_Expr(self, node: ast.Expr) -> None:
+        self._infer(node.value)
 
     # ── Assignment handlers ───────────────────────────────────────────────────
 
-    def _on_assign(self, node: ast.Assign) -> None:
+    def _stmt_Assign(self, node: ast.Assign) -> None:
         rhs_type = self._infer(node.value)
         target   = node.targets[0]
 
@@ -182,14 +531,14 @@ class TypeChecker(BaseValidator):
                     continue
                 var = elt.id
                 resolved = i32 if elem_type in _I32_BOOL_COMPAT else elem_type
-                existing = self._env.get(var)
+                existing = self._scope.env.get(var)
                 if existing is not None and not _types_compatible(existing, resolved):
                     raise CompilationError(
                         f"Type mismatch: cannot unpack '{type_name(resolved)}' "
                         f"into '{var}' (declared type '{type_name(existing)}').",
                         node=node,
                     )
-                self._env[var] = resolved
+                self._scope.env[var] = resolved
                 self.ctx.type_map[id(elt)] = resolved
             return
 
@@ -220,7 +569,7 @@ class TypeChecker(BaseValidator):
             if rhs_type in _I32_BOOL_COMPAT:
                 rhs_type = i32
 
-            existing = self._env.get(var)
+            existing = self._scope.env.get(var)
             if existing is not None:
                 if not _types_compatible(existing, rhs_type):
                     raise CompilationError(
@@ -230,7 +579,7 @@ class TypeChecker(BaseValidator):
                     )
                 self.ctx.type_map[id(target)] = existing
             else:
-                self._env[var] = rhs_type
+                self._scope.env[var] = rhs_type
                 self.ctx.type_map[id(target)] = rhs_type
 
         elif isinstance(target, ast.Attribute):
@@ -244,7 +593,7 @@ class TypeChecker(BaseValidator):
                         node=node,
                     )
 
-    def _on_ann_assign(self, node: ast.AnnAssign) -> None:
+    def _stmt_AnnAssign(self, node: ast.AnnAssign) -> None:
         ann_type = _resolve_annotation_node(node.annotation)
         # ol.bool / bool annotations declare an i32 variable (no bool in WGSL structs).
         if ann_type in _BOOL_TYPES:
@@ -276,7 +625,7 @@ class TypeChecker(BaseValidator):
                     f"Cannot resolve type annotation for '{var}'.", node=node
                 )
 
-            existing = self._env.get(var)
+            existing = self._scope.env.get(var)
             if existing is not None and existing is not resolved:
                 if not _types_compatible(existing, resolved):
                     raise CompilationError(
@@ -287,10 +636,10 @@ class TypeChecker(BaseValidator):
                     )
                 self.ctx.type_map[id(node.target)] = existing
             else:
-                self._env[var] = resolved
+                self._scope.env[var] = resolved
                 self.ctx.type_map[id(node.target)] = resolved
 
-    def _on_aug_assign(self, node: ast.AugAssign) -> None:
+    def _stmt_AugAssign(self, node: ast.AugAssign) -> None:
         target_type = self._infer(node.target)
         value_type  = self._infer(node.value)
 
@@ -309,14 +658,14 @@ class TypeChecker(BaseValidator):
                     node=node,
                 )
 
-    def _on_return(self, node: ast.Return) -> None:
-        expected = self._return_type
+    def _stmt_Return(self, node: ast.Return) -> None:
+        expected = self._scope.return_type
         is_void  = expected is None or expected is type(None)
 
         if node.value is None:
             if not is_void:
                 raise CompilationError(
-                    f"Method '{self._current_method}' "
+                    f"Method '{self._scope.name}' "
                     f"must return '{type_name(expected)}'.",
                     node=node,
                 )
@@ -327,13 +676,13 @@ class TypeChecker(BaseValidator):
             self.ctx.collected_tuple_types.add(expected)
             if not isinstance(node.value, ast.Tuple):
                 raise CompilationError(
-                    f"Return type mismatch in '{self._current_method}': "
+                    f"Return type mismatch in '{self._scope.name}': "
                     f"expected a tuple expression like '(a, b)', got a single value.",
                     node=node,
                 )
             if len(node.value.elts) != len(expected.elements):
                 raise CompilationError(
-                    f"Return type mismatch in '{self._current_method}': "
+                    f"Return type mismatch in '{self._scope.name}': "
                     f"expected {len(expected.elements)}-element tuple, "
                     f"got {len(node.value.elts)}.",
                     node=node,
@@ -342,7 +691,7 @@ class TypeChecker(BaseValidator):
                 act_elem = self._infer(elt)
                 if act_elem is not None and not _types_compatible(act_elem, exp_elem):
                     raise CompilationError(
-                        f"Return type mismatch in '{self._current_method}': "
+                        f"Return type mismatch in '{self._scope.name}': "
                         f"tuple element expected '{type_name(exp_elem)}', "
                         f"got '{type_name(act_elem)}'.",
                         node=node,
@@ -356,12 +705,12 @@ class TypeChecker(BaseValidator):
         if not is_void and actual is not None:
             if not _types_compatible(actual, expected):
                 raise CompilationError(
-                    f"Return type mismatch in '{self._current_method}': "
+                    f"Return type mismatch in '{self._scope.name}': "
                     f"expected '{type_name(expected)}', got '{type_name(actual)}'.",
                     node=node,
                 )
 
-    def _on_for(self, node: ast.For) -> None:
+    def _stmt_For(self, node: ast.For) -> None:
         it       = node.iter
         loop_var = node.target.id if isinstance(node.target, ast.Name) else None
 
@@ -377,7 +726,7 @@ class TypeChecker(BaseValidator):
                         node=node,
                     )
             if loop_var:
-                self._env[loop_var] = i32
+                self._scope.env[loop_var] = i32
                 self.ctx.type_map[id(node.target)] = i32
 
         elif isinstance(it, ast.Attribute):
@@ -386,203 +735,137 @@ class TypeChecker(BaseValidator):
                 container_type, it.attr, node
             )
             if loop_var and elem_type is not None:
-                self._env[loop_var] = elem_type
+                self._scope.env[loop_var] = elem_type
                 self.ctx.type_map[id(node.target)] = elem_type
 
         for s in node.body:
             self._check_stmt(s)
 
-    # ── Type inference ────────────────────────────────────────────────────────
+    # ── Type inference (Visitor) ──────────────────────────────────────────────
 
     def _infer(self, node: Optional[ast.expr]) -> Optional[Any]:
+        """Public entry point — infers the type of *node* and records it in
+        ctx.type_map.  Returns None when the type cannot be determined."""
         if node is None:
             return None
-        t = self._infer_impl(node)
+        t = self._dispatch_expr(node)
         if t is not None:
             self.ctx.type_map[id(node)] = t
         return t
 
-    def _infer_impl(self, node: ast.expr) -> Optional[Any]:
-        if isinstance(node, ast.Constant):
-            v = node.value
-            if isinstance(v, bool):  return ol_bool
-            if isinstance(v, int):   return int
-            if isinstance(v, float): return float
-            return None
+    def _dispatch_expr(self, node: ast.expr) -> Optional[Any]:
+        """Route *node* to the matching _expr_<ClassName> handler.
 
-        if isinstance(node, ast.Name):
-            if node.id in ("True", "False"):
-                return ol_bool
-            if node.id in _BUILTIN_NAMES:
-                return None
-            if node.id in _ANNOTATION_NAMES:
-                return _ANNOTATION_NAMES[node.id]
-            cv = self.ctx.constants.get(node.id) if self.ctx else None
-            if cv is not None:
-                return type(cv)
-            t = self._env.get(node.id)
-            if t is None:
-                raise CompilationError(
-                    f"Variable '{node.id}' has no known type at this point.",
-                    node=node,
-                )
-            return t
-
-        if isinstance(node, ast.Attribute):
-            # self.params.attr  →  Uniforms field lookup
-            if (isinstance(node.value, ast.Attribute)
-                    and isinstance(node.value.value, ast.Name)
-                    and node.value.value.id == "self"
-                    and node.value.attr == "params"):
-                params_class = type(self.ctx.sim_instance._params)
-                hints        = get_type_hints(params_class)
-                hint         = hints.get(node.attr)
-                if hint in _BOOL_TYPES:
-                    return i32
-                return hint
-
-            parent_t = self._infer(node.value)
-            return self._get_attr_type(parent_t, node.attr, node)
-
-        if isinstance(node, ast.BinOp):
-            lt = self._infer(node.left)
-            rt = self._infer(node.right)
-            return self._check_binop(node, lt, rt)
-
-        if isinstance(node, ast.BoolOp):
-            for v in node.values:
-                self._infer(v)
-            return ol_bool
-
-        if isinstance(node, ast.UnaryOp):
-            operand_type = self._infer(node.operand)
-            if isinstance(node.op, ast.Not):
-                return ol_bool
-            return operand_type
-
-        if isinstance(node, ast.IfExp):
-            self._infer(node.test)
-            t = self._infer(node.body)
-            self._infer(node.orelse)
-            return t
-
-        if isinstance(node, ast.Subscript):
-            container_type = self._infer(node.value)
-            if isinstance(container_type, TupleType):
-                slice_val = node.slice
-                if isinstance(slice_val, ast.Constant) and isinstance(slice_val.value, int):
-                    idx = slice_val.value
-                    if 0 <= idx < len(container_type.elements):
-                        return container_type.elements[idx]
-                    raise CompilationError(
-                        f"Tuple index {idx} out of range for tuple of length {len(container_type.elements)}.",
-                        node=node
-                    )
-                raise CompilationError(
-                    "Tuples can only be indexed with integer constants.",
-                    node=node
-                )
-            return None
-
-        if isinstance(node, ast.Call):
-            return self._infer_call(node)
-
-        if isinstance(node, ast.Compare):
-            self._infer(node.left)
-            for c in node.comparators:
-                self._infer(c)
-            return ol_bool
-
+        Unknown expression types return None, preserving the same behaviour
+        as the old isinstance chain's fall-through.
+        """
+        handler = getattr(self, f"_expr_{type(node).__name__}", None)
+        if handler is not None:
+            return handler(node)
         return None
 
-    # ── Call inference ────────────────────────────────────────────────────────
+    # ── Expression handlers ───────────────────────────────────────────────────
 
-    def _infer_call(self, node: ast.Call) -> Optional[Any]:
-        # Infer all argument types first so type_map is populated for callees.
+    def _expr_Constant(self, node: ast.Constant) -> Optional[Any]:
+        v = node.value
+        if isinstance(v, bool):  return ol_bool
+        if isinstance(v, int):   return int
+        if isinstance(v, float): return float
+        return None
+
+    def _expr_Name(self, node: ast.Name) -> Optional[Any]:
+        if node.id in ("True", "False"):
+            return ol_bool
+        if node.id in _BUILTIN_NAMES:
+            return None
+        if node.id in _ANNOTATION_NAMES:
+            return _ANNOTATION_NAMES[node.id]
+        cv = self.ctx.constants.get(node.id) if self.ctx else None
+        if cv is not None:
+            return type(cv)
+        t = self._scope.env.get(node.id)
+        if t is None:
+            raise CompilationError(
+                f"Variable '{node.id}' has no known type at this point.",
+                node=node,
+            )
+        return t
+
+    def _expr_Attribute(self, node: ast.Attribute) -> Optional[Any]:
+        # self.params.attr  →  Uniforms field lookup
+        if (isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"
+                and node.value.attr == "params"):
+            params_class = type(self.ctx.sim_instance._params)
+            hints        = get_type_hints(params_class)
+            hint         = hints.get(node.attr)
+            if hint in _BOOL_TYPES:
+                return i32
+            return hint
+
+        parent_t = self._infer(node.value)
+        return self._get_attr_type(parent_t, node.attr, node)
+
+    def _expr_BinOp(self, node: ast.BinOp) -> Optional[Any]:
+        lt = self._infer(node.left)
+        rt = self._infer(node.right)
+        return self._check_binop(node, lt, rt)
+
+    def _expr_BoolOp(self, node: ast.BoolOp) -> Optional[Any]:
+        for v in node.values:
+            self._infer(v)
+        return ol_bool
+
+    def _expr_UnaryOp(self, node: ast.UnaryOp) -> Optional[Any]:
+        operand_type = self._infer(node.operand)
+        if isinstance(node.op, ast.Not):
+            return ol_bool
+        return operand_type
+
+    def _expr_IfExp(self, node: ast.IfExp) -> Optional[Any]:
+        self._infer(node.test)
+        t = self._infer(node.body)
+        self._infer(node.orelse)
+        return t
+
+    def _expr_Subscript(self, node: ast.Subscript) -> Optional[Any]:
+        container_type = self._infer(node.value)
+        if not isinstance(container_type, TupleType):
+            return None
+        slice_val = node.slice
+        if isinstance(slice_val, ast.Constant) and isinstance(slice_val.value, int):
+            idx = slice_val.value
+            if 0 <= idx < len(container_type.elements):
+                return container_type.elements[idx]
+            raise CompilationError(
+                f"Tuple index {idx} out of range "
+                f"for tuple of length {len(container_type.elements)}.",
+                node=node,
+            )
+        raise CompilationError(
+            "Tuples can only be indexed with integer constants.",
+            node=node,
+        )
+
+    def _expr_Call(self, node: ast.Call) -> Optional[Any]:
         for arg in node.args:
             self._infer(arg)
         for kw in node.keywords:
             self._infer(kw.value)
 
-        func = node.func
-
-        # ── 1. self.method() — sim-class method or built-in grid getter ───────
-        if (isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "self"):
-
-            method_name = func.attr
-
-            # Built-in grid getters: return the matching user domain class.
-            if method_name == "tissue_at":
-                for user_cls, base_cls in self.ctx.memory_base_map.items():
-                    if base_cls is Tissue:
-                        return user_cls
-
-            if method_name == "chemistry_at":
-                for user_cls, base_cls in self.ctx.memory_base_map.items():
-                    if base_cls is Chemistry:
-                        return user_cls
-
-            # Regular sim-method: look up via mangled name.
-            ret = self.ctx.method_return_hints.get(mangle_sim(method_name))
-            if isinstance(ret, TupleType):
-                self.ctx.collected_tuple_types.add(ret)
-            return ret
-
-        # ── 2. obj.copy() — returns same type as obj ──────────────────────────
-        # Applies to domain objects (Cell, Tissue, …) AND vectors (vec3, ivec3).
-        # vec3 is classified as "primitive" by _is_primitive_type, but .copy()
-        # on a vector is explicitly permitted by Rule 1.3 and must preserve type.
-        if (isinstance(func, ast.Attribute)
-                and func.attr == "copy"
-                and not node.args):
-            obj_type = self._infer(func.value)
-            if obj_type is not None and (
-                not self._is_primitive_type(obj_type)   # domain objects
-                or obj_type in _VEC_TYPES               # vec3 / ivec3
-            ):
-                return obj_type
-
-        # ── 3. obj.method() — method on a domain object ───────────────────────
-        if isinstance(func, ast.Attribute):
-            obj_type = self._infer(func.value)
-            if obj_type is not None and not self._is_primitive_type(obj_type):
-                base_cls = self.ctx.get_base_class(obj_type)
-                if base_cls is not None:
-                    mangled = mangle_domain(base_cls, func.attr)
-                    return self.ctx.method_return_hints.get(mangled)
-
-        # ── 4. Intrinsic (ol.math) functions ──────────────────────────────────
-        func_name: Optional[str] = None
-        if isinstance(func, ast.Name):
-            func_name = func.id
-        elif isinstance(func, ast.Attribute):
-            func_name = func.attr
-
-        if func_name and func_name in _INTRINSIC_FUNCTIONS:
-            self._check_intrinsic_args(func_name, node)
-            if func_name in {"clamp", "abs", "sign", "min", "max"}:
-                if node.args:
-                    arg_type = self._infer(node.args[0])
-                    if arg_type is not None:
-                        return arg_type
-            return _INTRINSIC_FUNCTIONS[func_name]
-
-        # ── 5. Constructor calls ───────────────────────────────────────────────
-        if func_name:
-            if func_name in _ANNOTATION_NAMES:
-                return _ANNOTATION_NAMES[func_name]
-
-            for registered_type in self.ctx.class_field_types.keys():
-                if getattr(registered_type, "__name__", None) == func_name:
-                    return registered_type
-
-            for user_cls in self.ctx.memory_base_map.keys():
-                if getattr(user_cls, "__name__", None) == func_name:
-                    return user_cls
+        for resolver in _CALL_RESOLVERS:
+            result = resolver.resolve(node, self)
+            if result is not _UNHANDLED:
+                return result
 
         return None
+
+    def _expr_Compare(self, node: ast.Compare) -> Optional[Any]:
+        self._infer(node.left)
+        for c in node.comparators:
+            self._infer(c)
+        return ol_bool
 
     # ── Attribute type lookup ─────────────────────────────────────────────────
 
@@ -720,93 +1003,5 @@ class TypeChecker(BaseValidator):
     # ── Intrinsic argument checking ───────────────────────────────────────────
 
     def _check_intrinsic_args(self, func_name: str, node: ast.Call) -> None:
-        given_args = node.args
-        n_given    = len(given_args)
-
-        if func_name == "clamp":
-            if n_given != 3:
-                raise CompilationError(
-                    f"'{func_name}' expects 3 argument(s), got {n_given}.",
-                    node=node,
-                )
-            self._check_clamp_args(node)
-            return
-
-        constraints = _INTRINSIC_ARG_TYPES.get(func_name)
-        if constraints is None:
-            return  # No constraints registered → accept anything.
-
-        n_expected = len(constraints)
-        if n_given != n_expected:
-            raise CompilationError(
-                f"'{func_name}' expects {n_expected} argument(s), got {n_given}.",
-                node=node,
-            )
-
-        if func_name in {"min", "max"}:
-            t1 = self._infer(given_args[0])
-            t2 = self._infer(given_args[1])
-            for idx, t in enumerate((t1, t2)):
-                if t is not None and t not in _FLOAT_TYPES and t not in _INT_TYPES:
-                    raise CompilationError(
-                        f"Argument {idx + 1} of '{func_name}' must be f32 or i32, "
-                        f"got '{type_name(t)}'.",
-                        node=node,
-                    )
-            if t1 is not None and t2 is not None:
-                if (t1 in _FLOAT_TYPES) != (t2 in _FLOAT_TYPES):
-                    raise CompilationError(
-                        f"Type mismatch: '{func_name}' arguments must have the same "
-                        f"type, got '{type_name(t1)}' and '{type_name(t2)}'.",
-                        node=node,
-                    )
-
-        for idx, (arg_node, allowed_types) in enumerate(zip(given_args, constraints)):
-            arg_type = self._infer(arg_node)
-            if arg_type is None:
-                continue
-            if arg_type not in allowed_types:
-                nice_allowed = " | ".join(
-                    type_name(t) for t in sorted(allowed_types, key=type_name)
-                )
-                raise CompilationError(
-                    f"Argument {idx + 1} of '{func_name}' must be {nice_allowed}, "
-                    f"got '{type_name(arg_type)}'. "
-                    f"Hint: use a float literal (e.g. {func_name}(5.0)) "
-                    f"or an explicit cast (e.g. {func_name}(f32(x))).",
-                    node=arg_node,
-                )
-
-    def _check_clamp_args(self, node: ast.Call) -> None:
-        """clamp is overloaded: (f32,f32,f32) or (vec3,vec3,vec3)."""
-        arg_types = [self._infer(a) for a in node.args]
-        known     = [t for t in arg_types if t is not None]
-        if not known:
-            return
-
-        first    = known[0]
-        is_vec   = first in _VEC_TYPES
-        is_float = first in _FLOAT_TYPES
-
-        if not (is_vec or is_float):
-            raise CompilationError(
-                f"'clamp' requires f32 or vec3 arguments, got '{type_name(first)}'. "
-                f"Hint: use a float literal or an explicit f32(...) cast.",
-                node=node,
-            )
-
-        for idx, t in enumerate(arg_types):
-            if t is None:
-                continue
-            if is_vec and t not in _VEC_TYPES:
-                raise CompilationError(
-                    f"Argument {idx + 1} of 'clamp' must be vec3 "
-                    f"(to match argument 1), got '{type_name(t)}'.",
-                    node=node,
-                )
-            if is_float and t not in _FLOAT_TYPES:
-                raise CompilationError(
-                    f"Argument {idx + 1} of 'clamp' must be f32 "
-                    f"(to match argument 1), got '{type_name(t)}'.",
-                    node=node,
-                )
+        validator = _INTRINSIC_VALIDATORS.get(func_name, _DEFAULT_INTRINSIC_VALIDATOR)
+        validator.validate(func_name, node, self)
