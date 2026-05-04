@@ -103,11 +103,68 @@ class CallGraphValidator(BaseValidator):
             self._visit_function(func_node)
             self._current_caller = None
 
+        # Also walk domain-method bodies so that domain→domain call edges
+        # (e.g. cell_double_boost → cell_boost) are captured.
+        # Skip framework-internal methods (copy, copy_from, die, divide) whose
+        # source lives in _types.py — they use Python constructs irrelevant to
+        # the call graph.
+        for (user_cls, raw_name), func_node in ctx.domain_method_nodes.items():
+            base = _base_class_of(user_cls, ctx.memory_base_map)
+            if base is None:
+                continue
+            caller_mangled = _mangle_domain_method(base, raw_name)
+            location = ctx.method_locations.get(caller_mangled, ("", 1))[0]
+            if "_types" in location:
+                continue
+            self._current_caller = caller_mangled
+            self._visit_domain_function(func_node, user_cls)
+            self._current_caller = None
+
     def _visit_function(self, node: ast.FunctionDef) -> None:
         """Walk the function body collecting outgoing call edges."""
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
                 self._process_call(child)
+
+    def _visit_domain_function(
+        self, node: ast.FunctionDef, owner_cls: type
+    ) -> None:
+        """Walk a domain-method body.
+
+        Inside a domain method, "self" refers to the domain object (owner_cls),
+        not the sim instance.  self.method() therefore resolves to a call on
+        the same domain class, not a sim-method call.
+        """
+        base = _base_class_of(owner_cls, self.ctx.memory_base_map)
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            func = child.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if not isinstance(func.value, ast.Name):
+                continue
+
+            receiver = func.value.id
+            method_name = func.attr
+
+            if receiver == "self":
+                # self.method() inside a domain method → same-class domain call
+                if base is None:
+                    continue
+                callee_mangled = _mangle_domain_method(base, method_name)
+            else:
+                # other_obj.method() — look up type_map for the receiver node
+                obj_type = self.ctx.type_map.get(id(func.value))
+                if obj_type is None:
+                    continue
+                other_base = _base_class_of(obj_type, self.ctx.memory_base_map)
+                if other_base is None:
+                    continue
+                callee_mangled = _mangle_domain_method(other_base, method_name)
+
+            if self._current_caller is not None:
+                self.ctx.call_graph[self._current_caller].add(callee_mangled)
 
     def _process_call(self, node: ast.Call) -> None:
         if not isinstance(node.func, ast.Attribute):

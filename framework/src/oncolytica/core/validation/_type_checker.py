@@ -40,7 +40,7 @@ _ANNOTATION_NAMES: Dict[str, Any] = {
     "vec3": vec3, "ivec3": ivec3,
     "int": int, "float": float,
 }
-_BUILTIN_NAMES: frozenset = frozenset({"self", "ol", "range", "True", "False", "None"})
+_BUILTIN_NAMES: frozenset = frozenset({"ol", "range", "True", "False", "None"})
 
 _VEC3_COMPONENT_TYPE: Dict[Any, Any] = {vec3: f32, ivec3: i32}
 _VEC_ATTRS: FrozenSet[str] = frozenset({"x", "y", "z"})
@@ -124,6 +124,22 @@ class SelfMethodResolver(CallResolver):
                  if b is target_base),
                 None,
             )
+
+        # If we are inside a domain-method body, "self" refers to the
+        # domain object (e.g. BrainChem), not the sim instance.
+        # Look up the return hint via mangle_domain first.
+        scope_self_type = (
+            checker._scope.env.get("self") if checker._scope else None
+        )
+        if scope_self_type is not None:
+            base_cls = checker.ctx.get_base_class(scope_self_type)
+            if base_cls is not None:
+                mangled = mangle_domain(base_cls, method_name)
+                ret = checker.ctx.method_return_hints.get(mangled)
+                if ret is not None or mangled in checker.ctx.method_return_hints:
+                    if isinstance(ret, TupleType):
+                        checker.ctx.collected_tuple_types.add(ret)
+                    return ret
 
         # Regular sim-method: look up via mangled name.
         ret = checker.ctx.method_return_hints.get(mangle_sim(method_name))
@@ -438,6 +454,19 @@ class TypeChecker(BaseValidator):
         self.ctx = ctx
         ctx.type_map = {}
         for mangled_name, func_node in ctx.method_nodes.items():
+            self._check_function(mangled_name, func_node)
+        # Also type-check domain-method bodies so that type_map is populated
+        # for AST nodes inside Cell/Tissue/Chemistry/Metrics methods.
+        # Skip methods whose source lives in the framework itself (e.g.
+        # BaseData.copy / copy_from, Cell.die / divide).
+        for (user_cls, raw_name), func_node in ctx.domain_method_nodes.items():
+            base_cls = ctx.memory_base_map.get(user_cls)
+            if base_cls is None:
+                continue
+            mangled_name = mangle_domain(base_cls, raw_name)
+            location = ctx.method_locations.get(mangled_name, ("", 1))[0]
+            if "_types" in location:
+                continue
             self._check_function(mangled_name, func_node)
 
     # ── Per-method check ──────────────────────────────────────────────────────
@@ -785,6 +814,11 @@ class TypeChecker(BaseValidator):
             return type(cv)
         t = self._scope.env.get(node.id)
         if t is None:
+            # "self" in a sim-method has no tracked type (the sim object is
+            # not a GPU type); in domain-methods it is always in env as the
+            # user class.  Either way: unknown -> None, not an error.
+            if node.id == "self":
+                return None
             raise CompilationError(
                 f"Variable '{node.id}' has no known type at this point.",
                 node=node,

@@ -315,14 +315,15 @@ fn tissue_is_overcrowded(_self: Tissue, active_neighbor_count: i32, _rng_state: 
 
 fn chemistry_compute_laplacian(_self: Chemistry, _rng_state: ptr<function, u32>) -> f32 {
     var lap: f32;
+    var nb: Chemistry;
     lap = 0.0;
     return lap;
 }
 
 fn chemistry_step_pdgf(_self: ptr<function, Chemistry>, _rng_state: ptr<function, u32>) {
-    var _tuple_0: i32;
     var lap: f32;
     var new_val: f32;
+    var _tuple_0: i32;
     _tuple_0 = chemistry_compute_secretion_consumption((*_self), _rng_state);
     lap = chemistry_compute_laplacian((*_self), _rng_state);
     new_val = (((((*_self).pdgf + _tuple_0.get_0) - _tuple_0.get_1) + ((PDGF_D * 0.5) * lap)) * (1.0 - PDGF_DECAY));
