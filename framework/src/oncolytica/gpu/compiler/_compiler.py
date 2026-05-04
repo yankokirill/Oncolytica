@@ -1,4 +1,3 @@
-# oncolytica/gpu/_compiler.py
 from __future__ import annotations
 
 import ast
@@ -62,63 +61,116 @@ def _compile_helper_fn(
         uniforms_map: dict,
         val_ctx: Any,
         *,
-        wgsl_fn_name: str,          # final WGSL function name, e.g. "_gamma_infected" or "Cell_update"
+        wgsl_fn_name: str,
         main_param: str = "self",
         main_class: Optional[type] = None,
+        func_def: Optional[ast.FunctionDef] = None,
 ) -> tuple[str, dict[str, tuple[str, str]]]:
-    """Compile a non-rule method into a standalone WGSL function."""
+    """Compile a non-rule method into a standalone WGSL function.
+
+    For domain-class methods (main_class is not None), 'self' becomes the
+    first explicit WGSL parameter named '_self'.  It is passed as a pointer
+    (ptr<function, T>) when position 0 is in method_mutating_params, or by
+    value (_self: T) otherwise.
+
+    For sim-class methods (main_class is None), 'self' is skipped entirely —
+    the simulation object has no WGSL representation.
+    """
     hints = get_type_hints(method)
     sig   = inspect.signature(method)
 
     # Determine which parameter positions are mutated (from DomainValidator).
     mutating_positions: set[int] = val_ctx.method_mutating_params.get(wgsl_fn_name, set())
 
-    # Enumerate explicit parameters (skip 'self'), tracking 1-based position.
-    param_items = [
-        (pos + 1, pname, hints.get(pname, param.annotation))
-        for pos, (pname, param) in enumerate(sig.parameters.items())
-    ]
+    is_domain_method = main_class is not None
+    self_is_ptr = is_domain_method and (0 in mutating_positions)
 
-    # WGSL parameter list:
-    # - mutating domain params  → ptr<function, StructName>
-    # - mutating primitive params → "_pname: T" in signature, "var pname = _pname" in body
-    # - everything else          → plain "pname: T"
+    # Build ordered (position, name, annotation) list.
+    # Positions must match DomainValidator convention (1-based, excluding self):
+    #   self → position 0 (domain methods only)
+    #   first non-self param → position 1
+    #   second non-self param → position 2, etc.
+    #
+    # sig.parameters may or may not include 'self' depending on whether
+    # 'method' is a bound instance method (no self) or an unbound function (has self).
+    # We normalise by always treating the first param named 'self' as position 0,
+    # and numbering the rest from 1.
+    param_items: list[tuple[int, str, Any]] = []
+    non_self_pos = 0
+    for pname, param in sig.parameters.items():
+        if pname == "self":
+            if is_domain_method:
+                param_items.append((0, "self", main_class))
+            continue
+        non_self_pos += 1
+        param_items.append((non_self_pos, pname, hints.get(pname, param.annotation)))
+
+    # Build WGSL parameter list.
     wgsl_params: list[str] = []
-    mutable_primitive_params: list[tuple[str, str]] = []   # (pname, wgsl_type)
+    mutable_primitive_params: list[tuple[str, str]] = []
+
     for pos, pname, ann in param_items:
         if ann is inspect.Parameter.empty:
             continue
+
+        is_mutating = pos in mutating_positions
+
+        # ── Position 0: self → _self ──────────────────────────────────────────
+        if pos == 0 and is_domain_method:
+            try:
+                wgsl_type = py_type_to_wgsl(ann)
+            except TypeError:
+                continue
+            if self_is_ptr:
+                wgsl_params.append(f"_self: ptr<function, {wgsl_type}>")
+            else:
+                wgsl_params.append(f"_self: {wgsl_type}")
+            continue
+
+        # ── Regular parameters ────────────────────────────────────────────────
         try:
             wgsl_type = py_type_to_wgsl(ann)
         except TypeError:
             continue
-        is_domain   = domain_base_of(ann) is not None
+
+        is_domain    = domain_base_of(ann) is not None
         is_primitive = ann in PRIMITIVE_TYPES
-        is_mutating  = pos in mutating_positions
+
         if is_domain and is_mutating:
-            # Passed by pointer so the function can mutate the caller's copy.
             wgsl_params.append(f"{pname}: ptr<function, {wgsl_type}>")
         elif is_primitive and is_mutating:
-            # Declare as private "_pname" in signature; body will shadow with var.
             wgsl_params.append(f"_{pname}: {wgsl_type}")
             mutable_primitive_params.append((pname, wgsl_type))
         else:
             wgsl_params.append(f"{pname}: {wgsl_type}")
 
-    # Helpers receive rng state as a pointer instead of owning a local _rng.
+    # Helpers receive rng state as a pointer.
     wgsl_params.append("_rng_state: ptr<function, u32>")
 
-    # Return type
-    ret_ann  = hints.get("return", inspect.Parameter.empty)
-    ret_wgsl = ""
-    if ret_ann is not inspect.Parameter.empty:
-        try:
-            ret_wgsl = f" -> {py_type_to_wgsl(ret_ann)}"
-        except TypeError:
-            pass
+    # Return type.
+    from oncolytica.core.validation._context import TupleType
 
-    func     = getattr(method, "__func__", method)
-    func_def = _get_func_ast(func)
+    ret_wgsl = ""
+    _ret_type = val_ctx.method_return_hints.get(wgsl_fn_name)
+    if _ret_type is not None:
+        if isinstance(_ret_type, TupleType):
+            ret_wgsl = f" -> {_ret_type.wgsl_name()}"
+        else:
+            try:
+                ret_wgsl = f" -> {py_type_to_wgsl(_ret_type)}"
+            except TypeError:
+                pass
+    else:
+        ret_ann = hints.get("return", inspect.Parameter.empty)
+        if ret_ann is not inspect.Parameter.empty:
+            try:
+                ret_wgsl = f" -> {py_type_to_wgsl(ret_ann)}"
+            except TypeError:
+                pass
+
+    if func_def is None:
+        func     = getattr(method, "__func__", method)
+        func_def = _get_func_ast(func)
 
     ctx = TranslationContext(
         val_ctx=val_ctx,
@@ -128,6 +180,7 @@ def _compile_helper_fn(
         method_name=func_def.name,
         uniforms=uniforms_map,
         is_rule=False,
+        self_is_ptr=self_is_ptr,
     )
     StmtTranslator(ctx).translate_body(_skip_docstring(func_def.body))
 
@@ -181,7 +234,7 @@ class WGSLCompiler:
 
         sim = self.engine._sim
 
-        # ── Simulation-level helpers  (_method_name) ─────────────────────────
+        # ── Simulation-level helpers  (sim_method_name) ───────────────────────
         for name in dir(sim):
             if name.startswith("_"):
                 continue
@@ -192,19 +245,26 @@ class WGSLCompiler:
                 continue
             if name in ("chemistry_at", "tissue_at", "copy", "copy_from"):
                 continue
+
+            mangled_name = f"sim_{name}"
+            func_node = self.val_ctx.method_nodes.get(mangled_name)
+            if func_node is None:
+                continue
+
             try:
                 wgsl_fn, constants = _compile_helper_fn(
                     getattr(sim, name),
+                    func_def=func_node,
                     uniforms_map=uniforms_map,
                     val_ctx=self.val_ctx,
-                    wgsl_fn_name=f"sim_{name}",
+                    wgsl_fn_name=mangled_name,
                 )
                 all_constants.update(constants)
                 self.builder.add_helper_fn(wgsl_fn)
             except Exception as exc:
                 warnings.warn(f"Could not compile Simulation helper '{name}': {exc}")
 
-        # ── Domain-class helpers  (Cell_method, Tissue_method, …) ────────────
+        # ── Domain-class helpers  (prefix_method_name) ────────────────────────
         domain_classes = [
             self._spec.cell_class,
             self._spec.tissue_class,
@@ -215,23 +275,24 @@ class WGSLCompiler:
             base = domain_base_of(cls)
             if base is None:
                 continue
-            prefix = base.__name__
+            prefix = base.__name__.lower()
 
             for name, val in inspect.getmembers(cls, predicate=inspect.isfunction):
                 if name.startswith("_"):
                     continue
                 if name in ("copy", "copy_from"):
                     continue
-                # skip methods inherited from framework base classes
                 if any(name in vars(b) for b in BASE_CLASSES if b is not object):
                     continue
                 try:
+                    mangled_name = f"{prefix}_{name}"
                     wgsl_fn, constants = _compile_helper_fn(
                         val,
+                        func_def=None,
                         uniforms_map=uniforms_map,
                         val_ctx=self.val_ctx,
-                        wgsl_fn_name=f"{prefix}_{name}",
-                        main_param="self",
+                        wgsl_fn_name=mangled_name,
+                        main_param="_self",
                         main_class=cls,
                     )
                     all_constants.update(constants)
@@ -269,6 +330,7 @@ class WGSLCompiler:
             self.builder.add_metric_kernel(k_name, item_name, body)
 
         self.builder.add_all_constants(all_constants)
+        self.builder.add_tuple_structs(self.val_ctx.collected_tuple_types)
         return self.builder.build(ShaderBuilder.find_template())
 
     # ── Private compile helpers ───────────────────────────────────────────────

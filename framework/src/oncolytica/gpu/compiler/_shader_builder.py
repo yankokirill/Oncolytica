@@ -41,6 +41,7 @@ class ShaderBuilder:
         self._constants: list[str] = []     # const X: T = V; declarations
         self._helpers: list[str] = []       # WGSL helper fn bodies (non-rule methods)
         self._kernels: list[str] = []       # Stores compute shader kernel functions
+        self._tuple_structs: list[str] = []  # struct Tuple_* { ... } declarations
 
         self.cell_kernel_names:   list[str] = []
         self.tissue_kernel_names: list[str] = []
@@ -79,6 +80,33 @@ class ShaderBuilder:
         """Adds a compiled WGSL helper function (non-rule method) to USER_METHODS."""
         if wgsl_fn not in self._helpers:
             self._helpers.append(wgsl_fn)
+
+    def add_tuple_structs(self, tuple_types: "set") -> None:
+        """Generate and register WGSL struct declarations for all collected TupleTypes.
+
+        Called once by WGSLCompiler after all methods have been compiled.
+        Structs are deduplicated by wgsl_name().  Fields are named get_0, get_1, …
+        to mirror the transpiler's field-access convention.
+
+        Example output:
+            struct Tuple_i32_f32 {
+                get_0: i32,
+                get_1: f32,
+            }
+        """
+        from oncolytica.gpu.compiler._type_system import py_type_to_wgsl
+
+        seen: set[str] = set()
+        for tt in sorted(tuple_types, key=lambda t: t.wgsl_name()):
+            name = tt.wgsl_name()
+            if name in seen:
+                continue
+            seen.add(name)
+            fields = "\n".join(
+                f"    get_{i}: {py_type_to_wgsl(elem)},"
+                for i, elem in enumerate(tt.elements)
+            )
+            self._tuple_structs.append(f"struct {name} {{\n{fields}\n}}")
 
     def add_all_constants(self, constants: dict[str, tuple[str, str]]) -> None:
         """Adds all discovered constants to the shader as 'const' declarations."""
@@ -136,6 +164,8 @@ class ShaderBuilder:
         parts.append(wgsl_struct("Tissue",    self.tissue_packed))
         parts.append(wgsl_struct("Chemistry", self.chem_packed))
         parts.append(wgsl_struct("Metrics",   self.metrics_packed))
+        if self._tuple_structs:
+            parts.extend(self._tuple_structs)
         return "\n\n".join(parts)
 
     def _build_user_config(self) -> str:

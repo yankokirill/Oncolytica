@@ -49,6 +49,7 @@ _ZERO: dict[str, str] = {
     "u32":        "0u",
     "bool":       "false",
     "vec3<f32>":  "vec3<f32>(0.0, 0.0, 0.0)",
+    "vec3<i32>":  "vec3<i32>(0, 0, 0)",
 }
 
 # ── WGSL literal suffix for integer types ─────────────────────────────────────

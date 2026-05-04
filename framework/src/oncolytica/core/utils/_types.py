@@ -276,23 +276,25 @@ class Simulation(Generic[T, C, A, M, P]):
 
         for i, actual_class in enumerate(actual_types):
             base_class = BASE_CLASSES[i]
-            for i, actual_class in enumerate(actual_types):
-                base_class = BASE_CLASSES[i]
-                # ForwardRef возникает когда строковые аннотации переданы до объявления классов.
-                if isinstance(actual_class, str) or not isinstance(actual_class, type):
-                    raise TypeError(
-                        f"Parameter {i + 1} of ol.Simulation is a forward reference "
-                        f"(got string '{actual_class}' instead of a class). "
-                        f"Define all data classes before declaring the Simulation base, "
-                        f"or pass the classes directly: "
-                        f"class MySim(ol.Simulation[MyTissue, MyChemistry, MyCell, MyMetrics, MyParams])."
-                    )
-                if not issubclass(actual_class, BASE_CLASSES[i]):
-                    raise TypeError(
-                        f"Validation failed for parameter {i + 1} in ol.Simulation.\n"
-                        f"The type '{actual_class.__name__}' must be a subclass of 'ol.{base_class.__name__}'.\n"
-                        f"Example: MySimulation(ol.Simulation[MyTissue, MyChemistry, MyCell, MyMetrics, MyParams]).\n"
-                    )
+            if isinstance(actual_class, str) or not isinstance(actual_class, type):
+                raise TypeError(
+                    f"Parameter {i + 1} of ol.Simulation is a forward reference "
+                    f"(got string '{actual_class}' instead of a class). "
+                    f"Define all data classes before declaring the Simulation base, "
+                    f"or pass the classes directly: "
+                    f"class MySim(ol.Simulation[MyTissue, MyChemistry, MyCell, MyMetrics, MyParams])."
+                )
+            if not issubclass(actual_class, BASE_CLASSES[i]):
+                raise TypeError(
+                    f"Validation failed for parameter {i + 1} in ol.Simulation.\n"
+                    f"The type '{actual_class.__name__}' must be a subclass of 'ol.{base_class.__name__}'.\n"
+                    f"Example: MySimulation(ol.Simulation[MyTissue, MyChemistry, MyCell, MyMetrics, MyParams]).\n"
+                )
+            if len([b for b in BASE_CLASSES if issubclass(actual_class, b)]) > 1:
+                raise TypeError(
+                    f"Validation failed for parameter {i + 1} in ol.Simulation.\n"
+                    f"The type '{actual_class.__name__}' must be a subclass of exactly one base class: 'ol.{base_class.__name__}'.\n"
+                )
 
             if base_class is Cell:
                 hints = get_type_hints(actual_class)

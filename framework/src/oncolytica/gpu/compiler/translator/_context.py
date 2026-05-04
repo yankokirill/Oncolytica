@@ -2,36 +2,34 @@ import ast
 
 from oncolytica.gpu.compiler._type_system import py_type_to_wgsl
 from oncolytica.core.validation._context import ValidationContext
+from oncolytica.core.utils._math import _INTRINSIC_FUNCTIONS
 
 from typing import Any
 
 # WGSL struct names for built-in DSL agent types.
-# These are code-gen aliases that live outside py_type_to_wgsl.
 _RULE_TYPE_TO_MOCK_STRUCT: dict[str, str] = {
-    "cell":      "MockCell",
-    "tissue":    "MockTissue",
+    "cell": "MockCell",
+    "tissue": "MockTissue",
     "chemistry": "MockChemistry",
 }
 
 # self.<method> calls that are DSL builtins bypassing the TypeChecker.
-# TypeChecker doesn't know their return types, so we declare them here.
 _SELF_BUILTIN_RETURN: dict[str, str] = {
-    "tissue_at":    "Tissue",
+    "tissue_at": "Tissue",
     "chemistry_at": "Chemistry",
 }
 
 # Index variable name used in the compute kernel for each rule type.
 _RULE_TYPE_INDEX: dict[str, str] = {
-    "cell":      "cell_index",
-    "tissue":    "tissue_index",
+    "cell": "cell_index",
+    "tissue": "tissue_index",
     "chemistry": "chem_index",
 }
 
 # Out-buffer write statement template for each rule type that owns an agent.
-# {param} — the main parameter name; {index} — the kernel index variable.
 _RULE_TYPE_OUT_WRITE: dict[str, str] = {
-    "cell":      "Cells_Out[{index}] = {param};",
-    "tissue":    "Tissue_Out[{index}] = {param};",
+    "cell": "Cells_Out[{index}] = {param};",
+    "tissue": "Tissue_Out[{index}] = {param};",
     "chemistry": "Chemistry_Out[{index}] = {param};",
 }
 
@@ -48,6 +46,7 @@ class TranslationContext:
             is_rule: bool = True,
             metrics_param: str | None = None,
             uniforms: dict[str, str] | None = None,
+            self_is_ptr: bool = False,
     ) -> None:
         self.val_ctx = val_ctx
         self.rule_type = rule_type
@@ -55,17 +54,20 @@ class TranslationContext:
         self.metrics_param = metrics_param
         self.method_name = method_name
         self.uniforms = uniforms or {}
+        self.main_class_type: type | None = main_class
 
-        # True  → this context is translating a rule kernel body (has _rng local,
-        #          must write Out-buffer + rng_state before every return).
-        # False → translating a helper function (receives rng_state as ptr param).
+        # True  → rule kernel body (has _rng local, must write Out-buffer + rng_state before every return).
+        # False → helper function (receives rng_state as ptr param).
         self.is_rule: bool = is_rule
+
+        # True  → domain-method helper where 'self' is passed as ptr<function, T>.
+        # False → sim-method helper or value-receiver domain method.
+        self.self_is_ptr: bool = self_is_ptr
 
         self.globals_dict: dict[str, Any] = dict(val_ctx.constants)
         self.extracted_constants: dict[str, tuple[str, str]] = {}
 
         # ── Process global constants ─────────────────────────────────────────
-        # Booleans must be treated as i32 (0/1) for WGSL buffer compatibility.
         for name, val in self.globals_dict.items():
             if isinstance(val, bool):
                 self.extracted_constants[name] = ("i32", "1" if val else "0")
@@ -77,14 +79,18 @@ class TranslationContext:
         if not self.is_rule and main_class is not None:
             from oncolytica.gpu.compiler._type_system import domain_base_of
             base = domain_base_of(main_class)
-            prefix = base.__name__ if base else main_class.__name__.lower()
+            prefix = base.__name__.lower() if base else main_class.__name__.lower()
             mangled_name = f"{prefix}_{method_name}"
         else:
             mangled_name = f"sim_{method_name}"
 
         self.method_params: dict[str, str] = {}
         for pname, ptype in val_ctx.method_type_hints.get(mangled_name, {}).items():
-            self.method_params[pname] = py_type_to_wgsl(ptype)
+            if pname == "self":
+                # 'self' in domain-method hints → exposed as '_self' in WGSL
+                self.method_params["_self"] = py_type_to_wgsl(ptype)
+            else:
+                self.method_params[pname] = py_type_to_wgsl(ptype)
 
         self.local_vars: dict[str, str] = {}
         for var_name, py_type in val_ctx.symbol_table.get(mangled_name, {}).items():
@@ -95,19 +101,20 @@ class TranslationContext:
         self.let_vars: set[str] = set()
 
         # ── Pointer parameters ───────────────────────────────────────────────
-        # Names of function parameters that are passed as ptr<function, T> in
-        # WGSL (i.e. whose position appears in method_mutating_params for this
-        # method).  These must be dereferenced as (*param) when their fields are
-        # read/written, and passed bare (already a pointer) — not &param — when
-        # forwarded to another mutating-parameter position.
         mutating_positions: set[int] = val_ctx.method_mutating_params.get(mangled_name, set())
-        _param_names = list(val_ctx.method_type_hints.get(mangled_name, {}).keys())
+        # _param_names excludes 'self' (it's stored separately in method_type_hints for domain methods)
+        _param_names = [
+            pname for pname in val_ctx.method_type_hints.get(mangled_name, {}).keys()
+            if pname != "self"
+        ]
         self.ptr_params: set[str] = set()
-        # ptr_params only applies to helper functions (is_rule=False).
-        # In rule kernels the main agent is a plain `var` local, not a pointer —
-        # dereferencing it would be a WGSL type error.
         if not is_rule:
             for pos in mutating_positions:
+                if pos == 0:
+                    # Position 0 = self → _self in WGSL
+                    if self_is_ptr:
+                        self.ptr_params.add("_self")
+                    continue
                 # pos is 1-based (0 = self); _param_names is 0-indexed excluding self
                 idx = pos - 1
                 if 0 <= idx < len(_param_names):
@@ -123,11 +130,10 @@ class TranslationContext:
 
         self.struct_hints: dict[str, dict[str, str]] = {}
         for mem_class, fields in val_ctx.class_field_types.items():
-            wgsl_name = val_ctx.get_base_class(mem_class).__name__  # e.g., "Cell"
+            wgsl_name = val_ctx.get_base_class(mem_class).__name__
             self.struct_hints[wgsl_name] = {}
             for fname, ftype in fields.items():
                 wt = py_type_to_wgsl(ftype)
-                # Rule: Boolean fields in structs are physically stored as i32 in WGSL.
                 if wt == "bool":
                     wt = "i32"
                 self.struct_hints[wgsl_name][fname] = wt
@@ -145,21 +151,15 @@ class TranslationContext:
         self.source_map: dict[int, int] = {}
         self._tmp_counter = 0
         self._source_map_shifted = False
+        self.tuple_aliases: dict[str, str] = {}
 
     # ── RNG / epilogue helpers ────────────────────────────────────────────────
 
     @property
     def rng_index(self) -> str:
-        """Kernel index variable for the current rule type (e.g. "cell_index")."""
         return _RULE_TYPE_INDEX.get(self.rule_type, "cell_index")
 
     def rule_epilogue_lines(self) -> list[str]:
-        """Return the WGSL lines that must be emitted before every ``return``
-        in a rule kernel: save rng_state into the agent, then write Out-buffer.
-
-        For rule_type values that have no dedicated Out-buffer (e.g. metric rules)
-        only the rng line is returned.
-        """
         param = self.main_param
         index = self.rng_index
         lines: list[str] = [
@@ -173,23 +173,18 @@ class TranslationContext:
     # ── Primary type lookup ───────────────────────────────────────────────────
 
     def node_wgsl_type(self, node: ast.expr) -> str:
-        """Single source of truth for expression types during code generation.
-
-        Resolution order:
-        1. ``val_ctx.type_map`` — populated by TypeChecker.
-        2. DSL builtins (``self.tissue_at`` etc.).
-        3. Agent constructors (``MyCell()`` → main_wgsl_struct).
-        4. Fallback: "i32".
-        """
-        # ── 1. Validated type map (primary) ──────────────────────────────────
         wgsl = self.get_wgsl_type_of_node(node)
         if wgsl is not None:
-            # Enforce i32 for any attribute access inferred as bool by the TypeChecker.
             if isinstance(node, ast.Attribute) and wgsl == "bool":
                 return "i32"
             return wgsl
 
-        # ── 2. DSL builtin calls: self.tissue_at / self.chemistry_at ─────────
+        if isinstance(node, ast.Constant):
+            from oncolytica.gpu.compiler._type_system import infer_literal_wgsl_type
+            literal_type = infer_literal_wgsl_type(node)
+            if literal_type is not None:
+                return literal_type
+
         if isinstance(node, ast.Call):
             fn = node.func
             if (isinstance(fn, ast.Attribute)
@@ -199,7 +194,22 @@ class TranslationContext:
                 if builtin is not None:
                     return builtin
 
-        # ── 3. Agent constructor: MyCell() → main_wgsl_struct ────────────────
+            func_name = None
+            if isinstance(fn, ast.Attribute):
+                func_name = fn.attr
+            elif isinstance(fn, ast.Name):
+                func_name = fn.id
+
+            if func_name is not None:
+                if func_name in _INTRINSIC_FUNCTIONS:
+                    try:
+                        wgsl_t = py_type_to_wgsl(_INTRINSIC_FUNCTIONS[func_name])
+                        if wgsl_t == "bool":
+                            return "i32"
+                        return wgsl_t
+                    except TypeError:
+                        pass
+
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and self.main_class is not None
@@ -207,11 +217,22 @@ class TranslationContext:
             if self.main_wgsl_struct:
                 return self.main_wgsl_struct
 
-        # ── 4. Fallback ───────────────────────────────────────────────────────
+        if isinstance(node, ast.BinOp):
+            left_type = self.node_wgsl_type(node.left)
+            right_type = self.node_wgsl_type(node.right)
+            if "vec3" in left_type:
+                return left_type
+            if "vec3" in right_type:
+                return right_type
+            if left_type == "f32" or right_type == "f32":
+                return "f32"
+
+        if isinstance(node, ast.UnaryOp):
+            return self.node_wgsl_type(node.operand)
+
         return "i32"
 
     def get_wgsl_type_of_node(self, node: ast.AST) -> str | None:
-        """Convert a type_map entry to a WGSL type string, or None if absent."""
         py_type = self.val_ctx.type_map.get(id(node))
         if py_type is None:
             return None
@@ -224,7 +245,7 @@ class TranslationContext:
 
     def get_output(self) -> str:
         decls = [f"var {vname}: {vtype};" for vname, vtype in self.local_vars.items()
-                 if vname not in self.let_vars]
+                 if vname not in self.tuple_aliases]
 
         if decls and not self._source_map_shifted:
             self.source_map = {k + len(decls): v for k, v in self.source_map.items()}

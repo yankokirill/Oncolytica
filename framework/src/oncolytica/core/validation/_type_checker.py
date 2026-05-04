@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, Dict, FrozenSet, List, Optional, get_type_hints
+from typing import Any, Dict, FrozenSet, List, Optional, TypeVar, get_type_hints
 
 from oncolytica.core.utils._math import _INTRINSIC_FUNCTIONS, _INTRINSIC_ARG_TYPES
 from oncolytica.core.utils._types import (
@@ -13,7 +13,7 @@ from oncolytica.core.utils._types import (
 )
 from oncolytica.core.utils._errors import CompilationError
 from ._base import BaseValidator
-from ._context import ValidationContext, type_name, mangle_sim, mangle_domain
+from ._context import ValidationContext, type_name, mangle_sim, mangle_domain, TupleType, resolve_tuple_annotation
 
 # ── Type-group helpers ────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ _VEC_ATTRS: FrozenSet[str] = frozenset({"x", "y", "z"})
 # Built-in self.X() grid-getter calls — resolved by special-case logic,
 # not via method_return_hints.
 _GRID_GETTERS: frozenset = frozenset({"tissue_at", "chemistry_at"})
-
+_FRAMEWORK_SKIP_METHODS = frozenset({"copy", "copy_from"})
 
 def _types_compatible(a: Any, b: Any) -> bool:
     if a is b:
@@ -110,7 +110,6 @@ class TypeChecker(BaseValidator):
     def validate(self, ctx: ValidationContext) -> None:
         self.ctx = ctx
         ctx.type_map = {}
-        # ctx.method_nodes keys are mangled sim names ("sim_X").
         for mangled_name, func_node in ctx.method_nodes.items():
             self._check_function(mangled_name, func_node)
 
@@ -132,7 +131,9 @@ class TypeChecker(BaseValidator):
         for stmt in node.body:
             self._check_stmt(stmt)
 
-        self.ctx.symbol_table[mangled_name] = dict(self._env)
+        self.ctx.symbol_table[mangled_name] = {
+            k: v for k, v in self._env.items() if k != "self"
+        }
         self._env, self._current_method, self._return_type = saved
 
     # ── Statement dispatch ────────────────────────────────────────────────────
@@ -161,10 +162,49 @@ class TypeChecker(BaseValidator):
         rhs_type = self._infer(node.value)
         target   = node.targets[0]
 
+        # ── Tuple unpacking:  a, b = func() ──────────────────────────────────
+        if isinstance(target, ast.Tuple):
+            if not isinstance(rhs_type, TupleType):
+                raise CompilationError(
+                    f"Cannot unpack: the right-hand side does not return a tuple type. "
+                    f"Got '{type_name(rhs_type)}'.",
+                    node=node,
+                )
+            if len(target.elts) != len(rhs_type.elements):
+                raise CompilationError(
+                    f"Cannot unpack {len(rhs_type.elements)}-element tuple "
+                    f"into {len(target.elts)} variables.",
+                    node=node,
+                )
+            self.ctx.collected_tuple_types.add(rhs_type)
+            for elt, elem_type in zip(target.elts, rhs_type.elements):
+                if not isinstance(elt, ast.Name):
+                    continue
+                var = elt.id
+                resolved = i32 if elem_type in _I32_BOOL_COMPAT else elem_type
+                existing = self._env.get(var)
+                if existing is not None and not _types_compatible(existing, resolved):
+                    raise CompilationError(
+                        f"Type mismatch: cannot unpack '{type_name(resolved)}' "
+                        f"into '{var}' (declared type '{type_name(existing)}').",
+                        node=node,
+                    )
+                self._env[var] = resolved
+                self.ctx.type_map[id(elt)] = resolved
+            return
+
         target_name = (
             target.id if isinstance(target, ast.Name)
             else getattr(target, "attr", "<attribute>")
         )
+
+        if isinstance(rhs_type, TupleType):
+            raise CompilationError(
+                f"Cannot assign a tuple to '{target_name}'. "
+                f"Tuples must be unpacked immediately (e.g. 'a, b = func()') "
+                f"or indexed directly (e.g. 'func()[0]').",
+                node=node,
+            )
 
         if rhs_type is None:
             raise CompilationError(
@@ -210,6 +250,14 @@ class TypeChecker(BaseValidator):
         if ann_type in _BOOL_TYPES:
             ann_type = i32
         val_type = self._infer(node.value) if node.value else None
+
+        if isinstance(val_type, TupleType) or isinstance(ann_type, TupleType):
+            target_name = getattr(node.target, "id", "<attribute>")
+            raise CompilationError(
+                f"Cannot assign a tuple to '{target_name}'. "
+                f"Tuples must be unpacked immediately.",
+                node=node,
+            )
 
         if ann_type is not None and val_type is not None:
             if not _types_compatible(ann_type, val_type):
@@ -272,6 +320,36 @@ class TypeChecker(BaseValidator):
                     f"must return '{type_name(expected)}'.",
                     node=node,
                 )
+            return
+
+        # ── TupleType return: return (a, b) ──────────────────────────────────
+        if isinstance(expected, TupleType):
+            self.ctx.collected_tuple_types.add(expected)
+            if not isinstance(node.value, ast.Tuple):
+                raise CompilationError(
+                    f"Return type mismatch in '{self._current_method}': "
+                    f"expected a tuple expression like '(a, b)', got a single value.",
+                    node=node,
+                )
+            if len(node.value.elts) != len(expected.elements):
+                raise CompilationError(
+                    f"Return type mismatch in '{self._current_method}': "
+                    f"expected {len(expected.elements)}-element tuple, "
+                    f"got {len(node.value.elts)}.",
+                    node=node,
+                )
+            for elt, exp_elem in zip(node.value.elts, expected.elements):
+                act_elem = self._infer(elt)
+                if act_elem is not None and not _types_compatible(act_elem, exp_elem):
+                    raise CompilationError(
+                        f"Return type mismatch in '{self._current_method}': "
+                        f"tuple element expected '{type_name(exp_elem)}', "
+                        f"got '{type_name(act_elem)}'.",
+                        node=node,
+                    )
+            # Record the TupleType on the Tuple node itself so the statement
+            # translator can look it up via type_map when emitting the return.
+            self.ctx.type_map[id(node.value)] = expected
             return
 
         actual = self._infer(node.value)
@@ -388,6 +466,24 @@ class TypeChecker(BaseValidator):
             self._infer(node.orelse)
             return t
 
+        if isinstance(node, ast.Subscript):
+            container_type = self._infer(node.value)
+            if isinstance(container_type, TupleType):
+                slice_val = node.slice
+                if isinstance(slice_val, ast.Constant) and isinstance(slice_val.value, int):
+                    idx = slice_val.value
+                    if 0 <= idx < len(container_type.elements):
+                        return container_type.elements[idx]
+                    raise CompilationError(
+                        f"Tuple index {idx} out of range for tuple of length {len(container_type.elements)}.",
+                        node=node
+                    )
+                raise CompilationError(
+                    "Tuples can only be indexed with integer constants.",
+                    node=node
+                )
+            return None
+
         if isinstance(node, ast.Call):
             return self._infer_call(node)
 
@@ -429,14 +525,23 @@ class TypeChecker(BaseValidator):
                         return user_cls
 
             # Regular sim-method: look up via mangled name.
-            return self.ctx.method_return_hints.get(mangle_sim(method_name))
+            ret = self.ctx.method_return_hints.get(mangle_sim(method_name))
+            if isinstance(ret, TupleType):
+                self.ctx.collected_tuple_types.add(ret)
+            return ret
 
         # ── 2. obj.copy() — returns same type as obj ──────────────────────────
+        # Applies to domain objects (Cell, Tissue, …) AND vectors (vec3, ivec3).
+        # vec3 is classified as "primitive" by _is_primitive_type, but .copy()
+        # on a vector is explicitly permitted by Rule 1.3 and must preserve type.
         if (isinstance(func, ast.Attribute)
                 and func.attr == "copy"
                 and not node.args):
             obj_type = self._infer(func.value)
-            if obj_type is not None and not self._is_primitive_type(obj_type):
+            if obj_type is not None and (
+                not self._is_primitive_type(obj_type)   # domain objects
+                or obj_type in _VEC_TYPES               # vec3 / ivec3
+            ):
                 return obj_type
 
         # ── 3. obj.method() — method on a domain object ───────────────────────

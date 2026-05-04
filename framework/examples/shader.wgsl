@@ -18,6 +18,7 @@ const PDGF_DECAY: f32 = 0.005;
 const PDGF_SECRETE: f32 = 0.417;
 const TAU_MOVE: f32 = 0.71;
 const TAU_STOP: f32 = 1.17;
+const TWO_PI: f32 = 6.2831853;
 const TYPE_INACTIVE: i32 = 0;
 const TYPE_INFECTED: i32 = 1;
 const TYPE_RECRUITED: i32 = 2;
@@ -95,12 +96,18 @@ struct Chemistry {
 };
 
 struct Metrics {
+    total_alive: atomic<i32>,
     infected_count: atomic<i32>,
     recruited_count: atomic<i32>,
     inactive_count: atomic<i32>,
     total_cells: atomic<i32>,
     total_pdgf: f32,
 };
+
+struct Tuple_f32_f32 {
+    get_0: f32,
+    get_1: f32,
+}
 
 // ── Buffer Bindings ──────────────────────────────────────────────────────────
 
@@ -148,7 +155,7 @@ fn _rand_dir(state: ptr<function, u32>) -> vec3<f32> {
     );
 }
 
-fn interleave_9bit(input: u32) -> u32 {
+fn _interleave_9bit(input: u32) -> u32 {
     var x = input & 0x1ffu;
     x = (x | (x << 16)) & 0x030000ffu;
     x = (x | (x << 8))  & 0x0300f00fu;
@@ -157,44 +164,79 @@ fn interleave_9bit(input: u32) -> u32 {
     return x;
 }
 
-fn get_chemical_voxel_key(large_coord: vec3<i32>) -> u32 {
-    let x = interleave_9bit(u32(large_coord.x));
-    let y = interleave_9bit(u32(large_coord.y));
-    let z = interleave_9bit(u32(large_coord.z));
+fn _get_chemical_voxel_key(large_coord: vec3<i32>) -> u32 {
+    let x = _interleave_9bit(u32(large_coord.x));
+    let y = _interleave_9bit(u32(large_coord.y));
+    let z = _interleave_9bit(u32(large_coord.z));
     return x | (y << 1) | (z << 2);
 }
 
-fn get_sub_voxel_index(small_coord: vec3<i32>) -> u32 {
+fn _get_sub_voxel_index(small_coord: vec3<i32>) -> u32 {
     let x = u32(small_coord.x & 1);
     let y = u32(small_coord.y & 1);
     let z = u32(small_coord.z & 1);
     return x | (y << 1) | (z << 2);
 }
 
-fn get_tissue_voxel_key(small_coord: vec3<i32>) -> u32 {
+fn _get_tissue_voxel_key(small_coord: vec3<i32>) -> u32 {
     let large_coord = small_coord / 2;
-    let j = get_chemical_voxel_key(large_coord);
-    let i = get_sub_voxel_index(small_coord);
+    let j = _get_chemical_voxel_key(large_coord);
+    let i = _get_sub_voxel_index(small_coord);
     return (j << 3u) | i;
 }
 
-fn z_order_hash(coord: vec3<i32>) -> u32 {
-    return get_tissue_voxel_key(coord);
+fn _z_order_hash(coord: vec3<i32>) -> u32 {
+    return _get_tissue_voxel_key(coord);
 }
 
-fn is_tissue_coord_in_bounds(coord: vec3<i32>) -> bool {
+fn _is_tissue_coord_in_bounds(coord: vec3<i32>) -> bool {
     return u32(coord.x) < U.TissueGridDimX &&
            u32(coord.y) < U.TissueGridDimY &&
            u32(coord.z) < U.TissueGridDimZ;
 }
 
-fn is_chem_coord_in_bounds(coord: vec3<i32>) -> bool {
+fn _is_chem_coord_in_bounds(coord: vec3<i32>) -> bool {
     return u32(coord.x) < (U.TissueGridDimX / 2u) &&
            u32(coord.y) < (U.TissueGridDimY / 2u) &&
            u32(coord.z) < (U.TissueGridDimZ / 2u);
 }
 
-fn _gamma_infected(c_pp: f32) -> f32 {
+fn cell_attempt_division(_self: ptr<function, Cell>, p: f32, _rng_state: ptr<function, u32>) {
+    if ((p <= 0.0)) {
+        return;
+    }
+    (*_self).div_clock += p;
+    if (((*_self).div_clock < 1.0)) {
+        return;
+    }
+    (*_self).div_clock -= 1.0;
+    cell_spawn_daughter((*_self), _rng_state);
+}
+
+fn cell_enter_moving_state(_self: ptr<function, Cell>, tissue: Tissue, _rng_state: ptr<function, u32>) {
+    var rng_u: f32;
+    var angle: f32;
+    rng_u = clamp(_next_rand(_rng_state), 0.0001, 1.0);
+    (*_self).persistence_timer = clamp((-log(rng_u) * TAU_MOVE), 0.1, 100.0);
+    angle = cell_sample_direction((*_self), tissue, _rng_state);
+    (*_self).move_dir_x = cos(angle);
+    (*_self).move_dir_y = sin(angle);
+}
+
+fn cell_enter_stopped_state(_self: ptr<function, Cell>, _rng_state: ptr<function, u32>) {
+    var rng_u: f32;
+    rng_u = clamp(_next_rand(_rng_state), 0.0001, 1.0);
+    (*_self).persistence_timer = clamp((-log(rng_u) * TAU_STOP), 0.1, 100.0);
+}
+
+fn cell_move(_self: ptr<function, Cell>, m: f32, _rng_state: ptr<function, u32>) {
+    (*_self).prev_x = (*_self).pos.x;
+    (*_self).prev_y = (*_self).pos.y;
+    (*_self).pos.x = clamp(((*_self).pos.x + ((*_self).move_dir_x * m)), 0.0, 599.9);
+    (*_self).pos.y = clamp(((*_self).pos.y + ((*_self).move_dir_y * m)), 0.0, 599.9);
+}
+
+fn cell_phenotype_gamma_infected(_self: Cell, c_pp: f32, _rng_state: ptr<function, u32>) -> f32 {
     var num: f32;
     var den: f32;
     num = (C_PA + c_pp);
@@ -202,12 +244,89 @@ fn _gamma_infected(c_pp: f32) -> f32 {
     return (num / den);
 }
 
-fn _gamma_recruited(c_pp: f32) -> f32 {
-    var beta_k: f32;
-    var den: f32;
-    beta_k = (BETA * K_HILL);
-    den = (c_pp + beta_k);
-    return (c_pp / den);
+fn cell_phenotype_gamma_recruited(_self: Cell, c_pp: f32, _rng_state: ptr<function, u32>) -> f32 {
+    return (c_pp / (c_pp + (BETA * K_HILL)));
+}
+
+fn cell_sample_direction(_self: Cell, tissue: Tissue, _rng_state: ptr<function, u32>) -> f32 {
+    var u1: f32;
+    var u2: f32;
+    var z: f32;
+    var base: f32;
+    if ((tissue.is_white_matter != 0)) {
+        u1 = clamp(_next_rand(_rng_state), 0.0001, 1.0);
+        u2 = _next_rand(_rng_state);
+        z = (sqrt((-2.0 * log(u1))) * cos((TWO_PI * u2)));
+        base = atan2(tissue.tract_dir_y, tissue.tract_dir_x);
+        return (base + (z * 0.52359877));
+    }
+    return (_next_rand(_rng_state) * TWO_PI);
+}
+
+fn cell_save_position(_self: ptr<function, Cell>, _rng_state: ptr<function, u32>) {
+    (*_self).prev_x = (*_self).pos.x;
+    (*_self).prev_y = (*_self).pos.y;
+}
+
+fn cell_spawn_daughter(_self: Cell, _rng_state: ptr<function, u32>) {
+    var angle: f32;
+    var nx: f32;
+    var ny: f32;
+    var rng_u: f32;
+    var d_timer: f32;
+    var daughter: Cell;
+    angle = (_next_rand(_rng_state) * TWO_PI);
+    nx = clamp((_self.pos.x + (5.0 * cos(angle))), 0.0, 599.9);
+    ny = clamp((_self.pos.y + (5.0 * sin(angle))), 0.0, 599.9);
+    rng_u = clamp(_next_rand(_rng_state), 0.0001, 1.0);
+    d_timer = clamp((-log(rng_u) * TAU_STOP), 0.1, 100.0);
+    daughter = Cell();
+    let _spawn_idx0 = atomicAdd(&State.NewTotalAgents, 1u);
+    if (_spawn_idx0 < arrayLength(&Cells_Out)) {
+        Cells_Out[_spawn_idx0] = daughter;
+    }
+}
+
+fn cell_tick_persistence(_self: ptr<function, Cell>, tissue: Tissue, _rng_state: ptr<function, u32>) {
+    (*_self).persistence_timer -= 1.0;
+    if (((*_self).persistence_timer > 0.0)) {
+        return;
+    }
+    (*_self).is_moving = i32(!(((*_self).is_moving != 0)));
+    if (((*_self).is_moving != 0)) {
+        cell_enter_moving_state(_self, tissue, _rng_state);
+    } else {
+        cell_enter_stopped_state(_self, _rng_state);
+    }
+}
+
+fn cell_try_activate(_self: ptr<function, Cell>, c_pp: f32, _rng_state: ptr<function, u32>) -> i32 {
+    if ((c_pp > ACTIVATION_THR)) {
+        (*_self).cell_type = TYPE_RECRUITED;
+        (*_self).persistence_timer = TAU_STOP;
+        return true;
+    }
+    return false;
+}
+
+fn tissue_is_overcrowded(_self: Tissue, active_neighbor_count: i32, _rng_state: ptr<function, u32>) -> i32 {
+    return (active_neighbor_count >= _self.carrying_capacity);
+}
+
+fn chemistry_compute_laplacian(_self: Chemistry, _rng_state: ptr<function, u32>) -> f32 {
+    var lap: f32;
+    lap = 0.0;
+    return lap;
+}
+
+fn chemistry_step_pdgf(_self: ptr<function, Chemistry>, _rng_state: ptr<function, u32>) {
+    var _tuple_0: i32;
+    var lap: f32;
+    var new_val: f32;
+    _tuple_0 = chemistry_compute_secretion_consumption((*_self), _rng_state);
+    lap = chemistry_compute_laplacian((*_self), _rng_state);
+    new_val = (((((*_self).pdgf + _tuple_0.get_0) - _tuple_0.get_1) + ((PDGF_D * 0.5) * lap)) * (1.0 - PDGF_DECAY));
+    (*_self).pdgf = clamp(new_val, 0.0, 1000000.0);
 }
 
 // ===========================================================================
@@ -242,7 +361,7 @@ fn Kernel_CountAndOffset(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= atomicLoad(&State.NewTotalAgents)) { return; }
 
     let cell = Cells_In[idx];
-    let z_key = z_order_hash(vec3<i32>(cell.pos / U.TissueVoxelSize));
+    let z_key = _z_order_hash(vec3<i32>(cell.pos / U.TissueVoxelSize));
 
     let local_offset = atomicAdd(&VoxelTable[z_key].count, 1u);
 
@@ -420,139 +539,56 @@ fn Kernel_CellRule_0(@builtin(global_invocation_id) _id: vec3<u32>) {
     var chem: Chemistry;
     var tissue: Tissue;
     var c_pp: f32;
-    var gamma: f32;
-    var p: f32;
-    var m: f32;
-    var n_local: i32;
+    var active_neighbors: i32;
     var nb: Cell;
     var is_quiescent: i32;
-    var div_a: f32;
-    var nx: f32;
-    var ny: f32;
-    var d_rng: f32;
-    var d_timer: f32;
-    var daughter: Cell;
-    var go_u: f32;
-    var angle: f32;
-    var bm_u1: f32;
-    var bm_u2: f32;
-    var bm_z: f32;
-    var base: f32;
-    var stop_u: f32;
-    chem = Chemistry_In[get_chemical_voxel_key(clamp(vec3<i32>(cell.pos / (U.TissueVoxelSize * 2.0)), vec3<i32>(0, 0, 0), vec3<i32>(i32(U.TissueGridDimX / 2u) - 1, i32(U.TissueGridDimY / 2u) - 1, i32(U.TissueGridDimZ / 2u) - 1)))];
-    tissue = Tissue_In[z_order_hash(clamp(vec3<i32>(cell.pos / U.TissueVoxelSize), vec3<i32>(0, 0, 0), vec3<i32>(i32(U.TissueGridDimX) - 1, i32(U.TissueGridDimY) - 1, i32(U.TissueGridDimZ) - 1)))];
+    var _tuple_0: i32;
+    chem = Chemistry_In[_get_chemical_voxel_key(clamp(vec3<i32>(cell.pos / (U.TissueVoxelSize * 2.0)), vec3<i32>(0, 0, 0), vec3<i32>(i32(U.TissueGridDimX / 2u) - 1, i32(U.TissueGridDimY / 2u) - 1, i32(U.TissueGridDimZ / 2u) - 1)))];
+    tissue = Tissue_In[_z_order_hash(clamp(vec3<i32>(cell.pos / U.TissueVoxelSize), vec3<i32>(0, 0, 0), vec3<i32>(i32(U.TissueGridDimX) - 1, i32(U.TissueGridDimY) - 1, i32(U.TissueGridDimZ) - 1)))];
     c_pp = clamp(chem.pdgf, 0.0, 1000000.0);
-    if ((U.treatment_ap != 0)) {
-        if ((cell.cell_type != 0)) {
-            if ((cell.p_pot >= AP_THRESHOLD)) {
-                cell.pos = vec3<f32>(f32(U.TissueGridDimX), f32(U.TissueGridDimY), f32(U.TissueGridDimZ)) * U.TissueVoxelSize + vec3<f32>(U.TissueVoxelSize) / 2;
-                return;
-            }
+    if (((U.treatment_ap != 0)) && ((cell.cell_type != TYPE_INACTIVE))) {
+        if ((cell.p_pot >= AP_THRESHOLD)) {
+            cell.pos = vec3<f32>(f32(U.TissueGridDimX), f32(U.TissueGridDimY), f32(U.TissueGridDimZ)) * U.TissueVoxelSize + vec3<f32>(U.TissueVoxelSize) / 2;
+            cell._rng_state = _rng;
+            Cells_Out[cell_index] = cell;
+            return;
         }
     }
-    if ((cell.cell_type == 0)) {
-        if ((c_pp > ACTIVATION_THR)) {
-            cell.cell_type = 2;
-            cell.persistence_timer = TAU_STOP;
-        }
+    if ((cell.cell_type == TYPE_INACTIVE)) {
+        cell_try_activate(&cell, c_pp, &_rng);
+        cell._rng_state = _rng;
+        Cells_Out[cell_index] = cell;
         return;
     }
-    gamma = 0.0;
-    if ((cell.cell_type == 1)) {
-        gamma = _gamma_infected(c_pp);
-    } else {
-        gamma = _gamma_recruited(c_pp);
-    }
-    p = (cell.p_pot * gamma);
-    m = (cell.m_pot * gamma);
-    if ((U.treatment_am != 0)) {
-        m = (m * AM_FACTOR);
-    }
-    n_local = 0;
+    p = 0.0;
+    m = 0.0;
+    _tuple_0 = cell_compute_phenotype(cell, c_pp, &_rng);
+    active_neighbors = 0;
     {
         let _my_voxel = vec3<i32>(cell.pos / U.TissueVoxelSize);
-        for (var _k0 = 0u; _k0 < 27u; _k0 = _k0 + 1u) {
-            let _nv1 = _my_voxel + MooreOffsets[_k0];
-            if (!is_tissue_coord_in_bounds(_nv1)) { continue; }
-            let _nkey2 = z_order_hash(_nv1);
-            let _ns3 = VoxelTable[_nkey2].startIndex;
-            let _ne4 = _ns3 + atomicLoad(&VoxelTable[_nkey2].count);
-            for (var _j5 = _ns3; _j5 < _ne4; _j5 = _j5 + 1u) {
-                if (_j5 == cell_index) { continue; }
-                var nb = Cells_In[_j5];
-                if ((nb.cell_type != 0)) {
-                    n_local += 1;
+        for (var _k1 = 0u; _k1 < 27u; _k1 = _k1 + 1u) {
+            let _nv2 = _my_voxel + MooreOffsets[_k1];
+            if (!_is_tissue_coord_in_bounds(_nv2)) { continue; }
+            let _nkey3 = _z_order_hash(_nv2);
+            let _ns4 = VoxelTable[_nkey3].startIndex;
+            let _ne5 = _ns4 + atomicLoad(&VoxelTable[_nkey3].count);
+            for (var _j6 = _ns4; _j6 < _ne5; _j6 = _j6 + 1u) {
+                if (_j6 == cell_index) { continue; }
+                var nb = Cells_In[_j6];
+                if ((nb.cell_type != TYPE_INACTIVE)) {
+                    active_neighbors += 1;
                 }
             }
         }
     }
-    is_quiescent = 0;
-    if ((n_local >= tissue.carrying_capacity)) {
-        is_quiescent = 1;
+    is_quiescent = tissue_is_overcrowded(tissue, active_neighbors, &_rng);
+    if (!((is_quiescent != 0))) {
+        cell_attempt_division(&cell, _tuple_0.get_0, &_rng);
     }
-    if ((is_quiescent == 0)) {
-        if ((p > 0.0)) {
-            cell.div_clock += p;
-            if ((cell.div_clock >= 1.0)) {
-                cell.div_clock -= 1.0;
-                let _rand_0 = _next_rand(&_rng);
-                div_a = (_rand_0 * 6.2831853);
-                nx = clamp((cell.pos.x + (0.25 * cos(div_a))), 0.0, 145.99);
-                ny = clamp((cell.pos.y + (0.25 * sin(div_a))), 0.0, 99.99);
-                let _rand_1 = _next_rand(&_rng);
-                d_rng = clamp(_rand_1, 0.0001, 1.0);
-                d_timer = clamp((-log(d_rng) * TAU_STOP), 0.1, 100.0);
-                let _rand_2 = _next_rand(&_rng);
-                daughter = Cell();
-                daughter.pos = vec3<f32>(nx, ny, 0.5);
-                daughter.cell_type = cell.cell_type;
-                daughter.p_pot = cell.p_pot;
-                daughter.m_pot = cell.m_pot;
-                daughter.div_clock = (_rand_2 * 0.3);
-                daughter.is_moving = 0;
-                daughter.persistence_timer = d_timer;
-                daughter.prev_x = nx;
-                daughter.prev_y = ny;
-                let _spawn_idx6 = atomicAdd(&State.NewTotalAgents, 1u);
-                if (_spawn_idx6 < arrayLength(&Cells_Out)) {
-                    Cells_Out[_spawn_idx6] = daughter;
-                }
-            }
-        }
-    }
-    cell.persistence_timer -= 1.0;
-    if ((cell.persistence_timer <= 0.0)) {
-        cell.is_moving = i32(!((cell.is_moving != 0)));
-        if ((cell.is_moving != 0)) {
-            let _rand_3 = _next_rand(&_rng);
-            go_u = clamp(_rand_3, 0.0001, 1.0);
-            cell.persistence_timer = clamp((-log(go_u) * TAU_MOVE), 0.1, 100.0);
-            angle = 0.0;
-            if ((tissue.is_white_matter != 0)) {
-                let _rand_4 = _next_rand(&_rng);
-                bm_u1 = clamp(_rand_4, 0.0001, 1.0);
-                let _rand_5 = _next_rand(&_rng);
-                bm_u2 = _rand_5;
-                bm_z = (sqrt((-2.0 * log(bm_u1))) * cos((6.2831853 * bm_u2)));
-                base = atan2(tissue.tract_dir_y, tissue.tract_dir_x);
-                angle = (base + (bm_z * 0.52359877));
-            } else {
-                let _rand_6 = _next_rand(&_rng);
-                angle = (_rand_6 * 6.2831853);
-            }
-            cell.move_dir_x = cos(angle);
-            cell.move_dir_y = sin(angle);
-        } else {
-            let _rand_7 = _next_rand(&_rng);
-            stop_u = clamp(_rand_7, 0.0001, 1.0);
-            cell.persistence_timer = clamp((-log(stop_u) * TAU_STOP), 0.1, 100.0);
-        }
-    }
-    cell.prev_x = cell.pos.x;
-    cell.prev_y = cell.pos.y;
-    if (((cell.is_moving != 0)) && ((is_quiescent == 0)) && ((m > 0.0))) {
-        cell.pos.x = clamp((cell.pos.x + (cell.move_dir_x * m)), 0.0, 145.99);
-        cell.pos.y = clamp((cell.pos.y + (cell.move_dir_y * m)), 0.0, 99.99);
+    cell_tick_persistence(&cell, tissue, &_rng);
+    cell_save_position(&cell, &_rng);
+    if (((cell.is_moving != 0)) && (!((is_quiescent != 0))) && ((_tuple_0.get_1 > 0.0))) {
+        cell_move(&cell, _tuple_0.get_1, &_rng);
     }
     cell._rng_state = _rng;
     Cells_Out[cell_index] = cell;
@@ -564,51 +600,7 @@ fn Kernel_ChemRule_0(@builtin(global_invocation_id) _id: vec3<u32>) {
     if (chem_index >= U.NumVoxelTableEntries << 3) { return; }
     var chem = Chemistry_In[chem_index];
     var _rng = chem._rng_state;
-    var secretion: f32;
-    var consumption: f32;
-    var c: Cell;
-    var lap: f32;
-    var nb: Chemistry;
-    var exch: f32;
-    var lap_term: f32;
-    var decay_term: f32;
-    var new_val: f32;
-    secretion = 0.0;
-    consumption = 0.0;
-    {
-        let _tstart1 = chem_index * 8u;
-        for (var _i0 = 0u; _i0 < 8u; _i0 = _i0 + 1u) {
-            let _tkey3 = _tstart1 + _i0;
-            let _ts4 = VoxelTable[_tkey3].startIndex;
-            let _te5 = _ts4 + atomicLoad(&VoxelTable[_tkey3].count);
-            for (var _j2 = _ts4; _j2 < _te5; _j2 = _j2 + 1u) {
-                var c = Cells_In[_j2];
-                if ((c.cell_type == 1)) {
-                    secretion += PDGF_SECRETE;
-                }
-                if ((c.cell_type != 0)) {
-                    consumption += PDGF_CONSUME;
-                }
-            }
-        }
-    }
-    lap = 0.0;
-    {
-        for (var _k6 = 0u; _k6 < 27u; _k6 = _k6 + 1u + u32(_k6 == 13)) {
-            let _nc7 = chem._coord + MooreOffsets[_k6];
-            if (!is_chem_coord_in_bounds(_nc7)) { continue; }
-            let _nkey8 = get_chemical_voxel_key(_nc7);
-            var nb = Chemistry_In[_nkey8];
-            lap += (nb.pdgf - chem.pdgf);
-        }
-    }
-    exch = (chem.pdgf + secretion);
-    exch = (exch - consumption);
-    lap_term = ((PDGF_D * 0.5) * lap);
-    exch = (exch + lap_term);
-    decay_term = (1.0 - PDGF_DECAY);
-    new_val = (exch * decay_term);
-    chem.pdgf = clamp(new_val, 0.0, 1000000.0);
+    chemistry_step_pdgf(&chem, &_rng);
     chem._rng_state = _rng;
     Chemistry_Out[chem_index] = chem;
 }
@@ -619,13 +611,13 @@ fn Kernel_MetricRule_0(@builtin(global_invocation_id) _id: vec3<u32>) {
     if (cell_index >= State.TotalAgents) { return; }
     let cell = Cells_In[cell_index];
     atomicAdd(&MetricsBuffer.total_cells, 1);
-    if ((cell.cell_type == 1)) {
+    if ((cell.cell_type == TYPE_INFECTED)) {
         atomicAdd(&MetricsBuffer.infected_count, 1);
     }
-    if ((cell.cell_type == 2)) {
+    if ((cell.cell_type == TYPE_RECRUITED)) {
         atomicAdd(&MetricsBuffer.recruited_count, 1);
     }
-    if ((cell.cell_type == 0)) {
+    if ((cell.cell_type == TYPE_INACTIVE)) {
         atomicAdd(&MetricsBuffer.inactive_count, 1);
     }
 }

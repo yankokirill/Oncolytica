@@ -1027,22 +1027,9 @@ class TestMutablePrimitiveParams:
             def rule(self, cell: MyCell):
                 cell.energy = self.clamp_energy(cell, 100.0)
 
-        _load(S)
+        with pytest.raises(CompilationError, match=r"Forbidden reassignment of parameter 'cap'."):
+            _load(S)
 
-    def test_helper_with_mutated_i32_param_compiles(self):
-        """Helper that modifies an i32 param must compile without error."""
-
-        class S(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
-            def count_up(self, cell: MyCell, n: ol.i32) -> ol.i32:
-                if cell.health > 0.0:
-                    n = n + 1
-                return n
-
-            @ol.cell_rule
-            def rule(self, cell: MyCell):
-                cell.cell_type = self.count_up(cell, cell.cell_type)
-
-        _load(S)
 
     def test_helper_immutable_f32_param_no_prologue(self):
         """Helper that only reads an f32 param — no _d / var d prologue needed."""

@@ -481,3 +481,18 @@ def test_multiple_rules_execution():
     # 100 - 5 - 15 = 80
     assert math.isclose(engine.cells._data[0].health, 80.0)
 
+
+
+def test_fields_in_sim_forbidden():
+    """
+    Test that multiple rules of the same type are all discovered and executed.
+    """
+
+    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
+        local_field: int
+
+    engine = ol.Engine(backend="cpu")
+    engine.cells.add(MyCell(health=100.0))
+
+    with pytest.raises(RuntimeError, match="Fields in Simulation class are forbidden."):
+        engine.load_model(BadSim())

@@ -67,6 +67,7 @@ class Engine:
         for name, value in kwargs.items():
             self._sim._params.__setattr__(name, value)
 
+
     def setup_geometry(
             self,
             tissue_shape: tuple[int, int, int] = (120, 120, 120),

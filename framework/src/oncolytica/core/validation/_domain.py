@@ -4,12 +4,16 @@ import ast
 from typing import Any, Dict, FrozenSet, Optional, Set
 
 from oncolytica.core.utils._types import (
-    vec3,
+    vec3, ivec3,
     Cell,
 )
+
+_VECTOR_TYPES: frozenset = frozenset({vec3, ivec3})
 from oncolytica.core.utils._errors import CompilationError
 from ._base import BaseValidator
 from ._context import ValidationContext, type_name
+import textwrap as _textwrap
+import inspect as _inspect
 
 
 # ── RHS source classification ──────────────────────────────────────────────────
@@ -24,15 +28,28 @@ _GRID_GETTERS: frozenset[str] = frozenset({"chemistry_at", "tissue_at"})
 _MUTABILITY_EXEMPT_METHODS: frozenset[str] = frozenset({"copy", "copy_from"})
 
 
+_VECTOR_CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"vec3", "ivec3"})
+
+
 def _is_constructor_call(node: ast.expr, ctx: ValidationContext) -> bool:
-    """Rule 2.2 — True when *node* is a memory-type constructor call, e.g. DivCell()."""
+    """Rule 2.2 — True when *node* is a memory-type or vector constructor call."""
     if not isinstance(node, ast.Call):
         return False
     func = node.func
+    # Domain constructors: DivCell(), MyTissue(), …
     if isinstance(func, ast.Name):
         for user_cls in ctx.memory_base_map:
             if getattr(user_cls, "__name__", None) == func.id:
                 return True
+        # Bare vector constructors: vec3(...), ivec3(...)
+        if func.id in _VECTOR_CONSTRUCTOR_NAMES:
+            return True
+    # Qualified vector constructors: ol.vec3(...), ol.ivec3(...)
+    if (isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "ol"
+            and func.attr in _VECTOR_CONSTRUCTOR_NAMES):
+        return True
     return False
 
 
@@ -86,9 +103,14 @@ def _rhs_source(node: ast.expr, ctx: ValidationContext) -> str:
     ``"other"``        — non-memory-type expr          (→ irrelevant)
     """
     rhs_type = ctx.type_map.get(id(node))
-    if ctx.get_base_class(rhs_type) is None:
+    is_domain_obj = (
+        ctx.get_base_class(rhs_type) is not None
+        or rhs_type in _VECTOR_TYPES
+    )
+    if not is_domain_obj:
         return "other"
-
+    if rhs_type in _VECTOR_TYPES and not isinstance(node, ast.Name) and not isinstance(node, ast.Attribute):
+        return "constructor"
     if _is_constructor_call(node, ctx):
         return "constructor"
     if _is_copy_call(node):
@@ -117,6 +139,7 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
         self._current_method: Optional[str] = None
         self._in_init:        bool           = False
         self._pointer_args:   Set[str]       = set()
+        self._all_params:     Set[str]       = set()
         self._mutable_locals: Set[str]       = set()
         self._readonly_locals: Set[str]      = set()
 
@@ -156,9 +179,33 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
         for mangled, positions in _FRAMEWORK_MUTATING.items():
             ctx.method_mutating_params.setdefault(mangled, set(positions))
 
-        # Now analyse every sim-method AST node in topological order.
+        # Build a local lookup for mutation analysis — does NOT touch ctx.method_nodes.
+        _local_nodes: Dict[str, ast.FunctionDef] = dict(ctx.method_nodes)
+        for user_cls, base_cls in ctx.memory_base_map.items():
+            for raw_method_name in ctx.class_methods.get(user_cls, set()):
+                mangled = ctx.mangle_name(user_cls, raw_method_name)
+                if mangled in _local_nodes:
+                    continue
+                domain_node = ctx.domain_method_nodes.get((user_cls, raw_method_name))
+                if domain_node is not None:
+                    _local_nodes[mangled] = domain_node
+                    continue
+                method = getattr(user_cls, raw_method_name, None)
+                if method is None:
+                    continue
+                try:
+                    src = _textwrap.dedent(_inspect.getsource(method))
+                    tree = ast.parse(src)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef):
+                            _local_nodes[mangled] = node
+                            break
+                except Exception:
+                    pass
+
+        # Now analyse every method AST node in topological order.
         for mangled_name in ctx.ordered_methods:
-            func_node = ctx.method_nodes.get(mangled_name)
+            func_node = _local_nodes.get(mangled_name)
             if func_node is None:
                 continue
             hints = ctx.method_type_hints.get(mangled_name, {})
@@ -177,12 +224,13 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
                     root = target
                     while isinstance(root, ast.Attribute):
                         root = root.value
-                    if isinstance(root, ast.Name) and root.id != "self":
-                        try:
+                    if isinstance(root, ast.Name):
+                        if root.id == "self":
+                            if not mangled_name.startswith("sim_"):
+                                mutating.add(0)
+                        elif root.id in params:
                             idx = params.index(root.id)
                             mutating.add(idx + 1)  # +1 because self=0 is absent from hints
-                        except ValueError:
-                            pass
 
                 # Rule (2): transitive — argument passed to a mutating position.
                 if isinstance(stmt, ast.Call):
@@ -197,7 +245,10 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
                                 callee_mutating = ctx.method_mutating_params.get(callee_mangled, set())
                                 # Position 0 of callee == the receiver object.
                                 if 0 in callee_mutating:
-                                    if obj.id != "self":
+                                    if obj.id == "self":
+                                        if not mangled_name.startswith("sim_"):
+                                            mutating.add(0)
+                                    else:
                                         try:
                                             idx = params.index(obj.id)
                                             mutating.add(idx + 1)
@@ -214,12 +265,19 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
                                                 pass
 
                             # Rule (2b): transitive via self.helper(arg) calls.
-                            # When obj is "self" (sim-class helper call), look up
-                            # the callee's mutating positions and propagate them to
-                            # the current function's parameter list.
                             elif obj.id == "self" and method_attr not in _GRID_GETTERS:
-                                callee_mangled = ctx.mangle_name(None, method_attr)
+                                if not mangled_name.startswith("sim_"):
+                                    # Domain-method: self.method() calls another method
+                                    # on the same domain class. Resolve via the prefix
+                                    # extracted from the current mangled name.
+                                    prefix = mangled_name.split("_")[0]  # e.g. "cell"
+                                    callee_mangled = f"{prefix}_{method_attr}"
+                                else:
+                                    callee_mangled = ctx.mangle_name(None, method_attr)
                                 callee_mutating = ctx.method_mutating_params.get(callee_mangled, set())
+                                # Position 0 of callee == self → mark self (pos 0) mutating.
+                                if 0 in callee_mutating and not mangled_name.startswith("sim_"):
+                                    mutating.add(0)
                                 for j, arg in enumerate(stmt.args):
                                     if (j + 1) in callee_mutating:
                                         if isinstance(arg, ast.Name) and arg.id in params:
@@ -237,6 +295,7 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
         saved_method    = self._current_method
         saved_in_init   = self._in_init
         saved_pointers  = self._pointer_args.copy()
+        saved_all_params = self._all_params.copy()
         saved_mutable   = self._mutable_locals.copy()
         saved_readonly  = self._readonly_locals.copy()
 
@@ -257,6 +316,13 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
             if pname != "self" and self.ctx.get_base_class(ptype) is not None
         }
 
+        # Rule 3.4: track ALL parameters (excl. self) to forbid reassignment.
+        self._all_params = {
+            arg.arg
+            for arg in node.args.args
+            if arg.arg != "self"
+        }
+
         # If this is a domain-class method registered in ctx.class_methods,
         # add "self" (position 0) as a pointer-arg so mutation checks cover it.
         for cls, methods in self.ctx.class_methods.items():
@@ -272,6 +338,7 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
         self._current_method  = saved_method
         self._in_init         = saved_in_init
         self._pointer_args    = saved_pointers
+        self._all_params      = saved_all_params
         self._mutable_locals  = saved_mutable
         self._readonly_locals = saved_readonly
 
@@ -357,7 +424,14 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
             # WGSL type. TypeChecker writes the element type on id(node.target).
             loop_var  = node.target.id
             elem_type = self.ctx.type_map.get(id(node.target))
-            if elem_type is not None and self.ctx.get_base_class(elem_type) is not None:
+            is_domain_elem = (
+                elem_type is not None
+                and (
+                    self.ctx.get_base_class(elem_type) is not None
+                    or elem_type in _VECTOR_TYPES
+                )
+            )
+            if is_domain_elem:
                 self._readonly_locals.add(loop_var)
                 self._mutable_locals.discard(loop_var)
 
@@ -440,6 +514,8 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
                 obj_name = root.id
 
                 if obj_name == "self":
+                    if "self" in self._mutable_locals:
+                        return
                     if not self._in_init:
                         raise CompilationError(
                             f" Cannot modify 'self' properties here.\n\n"
@@ -482,6 +558,18 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
                     f"Use {var}.copy_from(other_object)",
                     node=node
                 )
+            # Rule 3.4: reassignment to any function parameter is forbidden.
+            if var in self._all_params and var not in self._pointer_args:
+                raise CompilationError(
+                    f"Forbidden reassignment of parameter '{var}'.\n\n"
+                    f"Function parameters cannot be reassigned inside a function body.\n\n"
+                    f"How to fix:\n"
+                    f"• To copy the value of another object into '{var}', use:\n"
+                    f"    {var}.copy_from(other_object)\n"
+                    f"• Or introduce a new local variable for the new value:\n"
+                    f"    local_{var} = <expression>",
+                    node=node,
+                )
 
     # ── Attribute access check ────────────────────────────────────────────────
 
@@ -506,6 +594,8 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
             return
 
         if parent_type is vec3 and node.attr not in self._VEC3_ATTRS:
+            if node.attr in _MUTABILITY_EXEMPT_METHODS:
+                return   # .copy() / .copy_from() are valid on vectors
             raise CompilationError(
                 f"'{node.attr}' is not a valid vec3 component.\n\n"
                 f"Use .x, .y, or .z to access vector components.", node=node
@@ -551,11 +641,24 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
         mutating = self.ctx.method_mutating_params.get(mangled, set())
 
         if 0 in mutating:
+            if obj_name in self._mutable_locals:
+                return
+            if obj_name in self._readonly_locals:
+                raise CompilationError(
+                    f"Cannot call '{method_name}()' on '{obj_name}'.\n\n"
+                    f"'{method_name}' mutates its receiver, but '{obj_name}' is "
+                    f"read-only (e.g. returned from tissue_at / chemistry_at or a loop iterator).\n\n"
+                    f"How to fix:\n"
+                    f"• If you need a mutable snapshot, copy it first:\n"
+                    f"    tmp = {obj_name}.copy()\n"
+                    f"    tmp.{method_name}()",
+                    node=node,
+                )
             raise CompilationError(
                 f"Cannot call '{method_name}()' on '{obj_name}'.\n\n"
-                f"'{method_name}' mutates its receiver, but '{obj_name}' is not the "
-                f"main (pointer) argument of this rule. "
-                f"Only the rule's primary agent may be mutated through method calls.",
+                f"'{method_name}' mutates its receiver, but '{obj_name}' is not a "
+                f"mutable object. Only [Mutable] objects (rule arguments, constructor "
+                f"results, or explicit copies) may have mutating methods called on them.",
                 node=node,
             )
 
@@ -594,13 +697,10 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
             if param_pos not in mutating_positions:
                 continue
 
-            # Check argument type — only domain objects need the mutability check.
-            # Primitives are always safe (Rule 3.3).
             arg_type = self.ctx.type_map.get(id(arg))
             if arg_type is None or self.ctx.get_base_class(arg_type) is None:
                 continue
 
-            # Case A: named variable that is read-only.
             if isinstance(arg, ast.Name):
                 arg_name = arg.id
                 if arg_name in self._readonly_locals:
@@ -617,15 +717,7 @@ class DomainValidator(BaseValidator, ast.NodeVisitor):
                         node=node,
                     )
 
-            # Case B: inline call expression (temporary — Rule 2.4).
-            # A mutable copy call (obj.copy()) assigned inline is the only exception:
-            # it produces a mutable temporary and is explicitly allowed by Rule 2.2 /
-            # Rule 3.1 example "self.heal_cell(neighbor.copy()) — Ошибка".
-            # Wait — the docs say neighbor.copy() passed DIRECTLY is STILL an error
-            # because it becomes a [Только для чтения] temporary (Rule 2.4).
-            # Only `tmp = neighbor.copy(); self.heal_cell(tmp)` is allowed.
             elif isinstance(arg, ast.Call):
-                # Determine a human-readable description of the inline expression.
                 if _is_grid_getter_call(arg):
                     source_desc = f"the result of a grid getter (e.g. tissue_at / chemistry_at)"
                 elif _is_copy_call(arg):

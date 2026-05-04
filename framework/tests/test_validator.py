@@ -115,12 +115,9 @@ def test_context_multiple_inheritance_forbidden():
         pos: ol.vec3 = ol.vec3(50.0, 50.0, 50.0)
         pass
 
-    class BadSim(ol.Simulation[MyTissue, MyChem, Mutant, MyMetrics, MyParams]):
-        pass
-
-    engine = ol.Engine(backend="cpu")
-    with pytest.raises(CompilationError, match="inherits from multiple framework base classes"):
-        engine.load_model(BadSim())
+    with pytest.raises(TypeError, match="must be a subclass of exactly one base class"):
+        class BadSim(ol.Simulation[MyTissue, MyChem, Mutant, MyMetrics, MyParams]):
+            pass
 
 
 # ===========================================================================

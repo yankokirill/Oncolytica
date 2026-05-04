@@ -134,21 +134,6 @@ class TestHelperSignatures:
         assert re.search(r"\bsrc: Cell\b", wgsl), f"Expected src as plain Cell:\n{wgsl}"
         assert "dst: ptr<function, Cell>" in wgsl, f"Expected dst as ptr:\n{wgsl}"
 
-    def test_primitive_mutating_param_uses_underscore_pattern(self):
-        """Mutating primitive param → _pname in signature + var pname = _pname prologue."""
-
-        class S(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
-            def accum(self, total: ol.f32, delta: ol.f32) -> ol.f32:
-                total += delta
-                return total
-
-            @ol.cell_rule
-            def rule(self, cell: MyCell):
-                pass
-
-        wgsl = _compile_sim_helper(S(), "accum")
-        assert "_total: f32" in wgsl, f"Expected _total in signature:\n{wgsl}"
-        assert "var total: f32 = _total;" in wgsl, f"Expected var prologue:\n{wgsl}"
 
     def test_rng_state_always_last_param(self):
         """Every helper always ends with _rng_state: ptr<function, u32>."""
@@ -324,3 +309,39 @@ class TestPtrParamDereferenceInBody:
         assert "(*cell)" not in wgsl, (
             f"Rule main arg must not be dereferenced:\n{wgsl}"
         )
+
+
+def test_vec3_assign_without_copy():
+    wgpu = pytest.importorskip("wgpu")
+
+    class BadSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
+        @ol.cell_rule
+        def rule(self, cell: MyCell):
+            a: ol.ivec3
+            b: ol.ivec3 = ol.ivec3()
+            a = b
+
+    engine = ol.Engine(backend="gpu")
+    engine.cells.add(MyCell())
+
+    with pytest.raises(Exception) as excinfo:
+        engine.load_model(BadSim())
+
+
+def test_vec3_assign_with_copy():
+    wgpu = pytest.importorskip("wgpu")
+
+    class GoodSim(ol.Simulation[MyTissue, MyChem, MyCell, MyMetrics, MyParams]):
+        @ol.cell_rule
+        def rule(self, cell: MyCell):
+            a: ol.ivec3
+            b: ol.ivec3 = ol.ivec3()
+            a = b.copy()
+
+    engine = ol.Engine(backend="gpu")
+    engine.cells.add(MyCell())
+
+    try:
+        engine.load_model(GoodSim())
+    except Exception as e:
+        pytest.fail(f"GPU execution failed for GoodSim: {e}")

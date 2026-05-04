@@ -4,7 +4,7 @@ import ast
 import inspect
 import textwrap
 from typing import get_origin, get_type_hints, get_args
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Generator, Annotated
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Generator, Annotated, Iterator
 
 from oncolytica.core.utils._types import (
     BASE_CLASSES, ANNOTATION_NAMES, ivec3,
@@ -17,6 +17,52 @@ from oncolytica.core.utils._types import (
 from oncolytica.core.utils._errors import CompilationError
 
 
+# ── TupleType ─────────────────────────────────────────────────────────────────
+
+_WGSL_SHORT: Dict[Any, str] = {}
+
+
+def _wgsl_elem_name(t: Any) -> str:
+    from oncolytica.gpu.compiler._type_system import py_type_to_wgsl
+    try:
+        return py_type_to_wgsl(t)
+    except TypeError:
+        return getattr(t, "__name__", repr(t))
+
+
+class TupleType:
+    __slots__ = ("elements",)
+
+    def __init__(self, *elements: Any) -> None:
+        self.elements: tuple = tuple(elements)
+
+    def wgsl_name(self) -> str:
+        return "Tuple_" + "_".join(_wgsl_elem_name(t) for t in self.elements)
+
+    def __repr__(self) -> str:
+        names = ", ".join(getattr(t, "__name__", repr(t)) for t in self.elements)
+        return f"TupleType({names})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TupleType) and self.elements == other.elements
+
+    def __hash__(self) -> int:
+        return hash(("TupleType", self.elements))
+
+
+def resolve_tuple_annotation(hint: Any) -> Optional["TupleType"]:
+    import typing
+    origin = get_origin(hint)
+    if origin not in (tuple, typing.Tuple):
+        return None
+    args = get_args(hint)
+    if not args:
+        return None
+    if len(args) == 2 and args[1] is Ellipsis:
+        return None
+    return TupleType(*args)
+
+
 RULE_DECORATOR_NAMES: FrozenSet[str] = frozenset({
     "cell_rule", "tissue_rule", "chemistry_rule", "metric_rule",
 })
@@ -25,7 +71,6 @@ SYSTEM_FIELDS: Dict[type, FrozenSet[str]] = {
     Cell: frozenset({"pos"}),
 }
 
-# Maps framework base class → canonical name prefix used in mangling.
 _BASE_PREFIX: Dict[type, str] = {
     Cell:      "cell",
     Tissue:    "tissue",
@@ -42,20 +87,14 @@ def _is_gpu_compatible_type(t: Any) -> bool:
     return any(issubclass(t, base) for base in BASE_CLASSES if isinstance(base, type))
 
 
-# ── Public mangling helpers ────────────────────────────────────────────────────
-
 def mangle_sim(method_name: str) -> str:
-    """Sim-class method: 'spawn' → 'sim_spawn'."""
     return f"sim_{method_name}"
 
 
 def mangle_domain(base_cls: type, method_name: str) -> str:
-    """Domain-class method: Cell, 'update' → 'cell_update'."""
     prefix = _BASE_PREFIX.get(base_cls, base_cls.__name__.lower())
     return f"{prefix}_{method_name}"
 
-
-# ── Type-name utility (single authoritative definition) ───────────────────────
 
 def type_name(t: Any) -> str:
     return getattr(t, "__name__", repr(t))
@@ -66,19 +105,6 @@ def type_name(t: Any) -> str:
 # =============================================================================
 
 class ValidationContext:
-    """
-    Blackboard shared by all pipeline phases.
-
-    Naming convention
-    -----------------
-    All keys in method_* dicts use **mangled names**:
-      • sim-class methods  → "sim_{name}"   (e.g. "sim_spawn")
-      • domain-class methods → "{prefix}_{name}"  (e.g. "cell_update")
-
-    Use ``mangle_sim`` / ``mangle_domain`` helpers (module-level) or the
-    instance method ``mangle_name`` to produce keys consistently.
-    """
-
     def __init__(self, sim_instance: Any) -> None:
         self.sim_instance: Any = sim_instance
 
@@ -92,26 +118,24 @@ class ValidationContext:
         self.source_code: str = ""
         self.tree: Optional[ast.Module] = None
 
-        # Keys are mangled names for sim-methods; raw names for domain-methods
-        # are additionally mangled via mangle_domain before insertion.
         self.method_signatures:   Dict[str, inspect.Signature] = {}
-        self.method_type_hints:   Dict[str, Dict[str, Any]] = {}   # includes "self" at index 0 for domain methods
+        self.method_type_hints:   Dict[str, Dict[str, Any]] = {}
         self.method_return_hints: Dict[str, Optional[Any]] = {}
 
-        # Class-level metadata for domain classes (Cell, Tissue, …)
         self.class_fields:        Dict[type, Set[str]] = {}
         self.class_properties:    Dict[type, Set[str]] = {}
-        self.class_methods:       Dict[type, Set[str]] = {}          # raw method names per class
+        self.class_methods:       Dict[type, Set[str]] = {}
         self.class_generators:    Dict[type, Set[str]] = {}
         self.class_field_types:   Dict[type, Dict[str, Any]] = {}
         self.constants:           Dict[str, Any] = {}
 
-        # AST nodes — keyed by mangled name for sim-methods;
-        # domain-method nodes are NOT stored here (no source available from
-        # the sim class AST).
+        # Sim-method AST nodes — keyed by mangled sim name ("sim_spawn").
         self.method_nodes:        Dict[str, ast.FunctionDef] = {}
 
-        # Mangled names
+        # Domain-method AST nodes — keyed by (user_cls, raw_method_name).
+        # Populated by ContextBuilder._build_domain_method_signatures.
+        self.domain_method_nodes: Dict[Tuple[type, str], ast.FunctionDef] = {}
+
         self.rule_method_names:   Set[str] = set()
         self.helper_method_names: Set[str] = set()
 
@@ -120,30 +144,19 @@ class ValidationContext:
         self.call_graph:      Dict[str, Set[str]] = {}
         self.ordered_methods: List[str] = []
 
-        # Source location for error reporting — keyed by mangled name.
         self.method_locations: Dict[str, Tuple[str, int]] = {}
 
-        # Mutating parameter positions — filled by DomainValidator.
-        # Maps mangled method name → set of argument indices (0 = self / first ptr).
         self.method_mutating_params: Dict[str, Set[int]] = {}
 
-    # ── Mangling ───────────────────────────────────────────────────────────────
+        self.collected_tuple_types: Set[TupleType] = set()
 
     def mangle_name(self, cls: Optional[type], method_name: str) -> str:
-        """
-        Produce a mangled method name.
-
-        ``cls=None``          → sim-method  ("sim_{method_name}")
-        ``cls=<domain cls>``  → domain method ("{prefix}_{method_name}")
-        """
         if cls is None:
             return mangle_sim(method_name)
         base = self.memory_base_map.get(cls)
         if base is None:
             raise ValueError(f"'{type_name(cls)}' is not a registered domain class.")
         return mangle_domain(base, method_name)
-
-    # ── Attribute helpers ──────────────────────────────────────────────────────
 
     def all_valid_attrs(self, cls: type) -> Set[str]:
         return (
@@ -176,7 +189,6 @@ class ContextBuilder:
     def build(sim_instance: Any) -> ValidationContext:
         ctx = ValidationContext(sim_instance)
         sim_class = sim_instance.__class__
-        ContextBuilder._validate_memory_base_map(ctx.memory_base_map)
         ContextBuilder._build_ast(ctx, sim_class)
         ContextBuilder._build_sim_signatures(ctx, sim_class)
         ContextBuilder._build_class_metadata(ctx)
@@ -184,30 +196,6 @@ class ContextBuilder:
         ContextBuilder._build_constants(ctx)
         ContextBuilder._classify_methods(ctx)
         return ctx
-
-    # ── Memory map validation ──────────────────────────────────────────────────
-
-    @staticmethod
-    def _validate_memory_base_map(memory_base_map: Dict[type, type]) -> None:
-        for cls, expected_base in memory_base_map.items():
-            actual_bases = [b for b in cls.__bases__ if b in BASE_CLASSES]
-            if len(actual_bases) == 0:
-                raise CompilationError(
-                    f"Memory class '{cls.__name__}' must inherit directly from exactly one of: "
-                    f"{', '.join(b.__name__ for b in BASE_CLASSES)}"
-                )
-            if len(actual_bases) > 1:
-                raise CompilationError(
-                    f"Memory class '{cls.__name__}' inherits from multiple framework base classes. "
-                    f"Multiple inheritance is not supported."
-                )
-            if actual_bases[0] is not expected_base:
-                raise CompilationError(
-                    f"Memory class '{cls.__name__}' inherits from '{actual_bases[0].__name__}' "
-                    f"but map expects '{expected_base.__name__}'"
-                )
-
-    # ── AST construction ───────────────────────────────────────────────────────
 
     @staticmethod
     def _build_ast(ctx: ValidationContext, sim_class: type) -> None:
@@ -226,13 +214,11 @@ class ContextBuilder:
                 f"Syntax error in '{sim_class.__name__}': {exc}"
             ) from exc
 
-        # Annotate every AST node with its parent for error reporting.
         ctx.tree.parent = None  # type: ignore[attr-defined]
         for node in ast.walk(ctx.tree):
             for child in ast.iter_child_nodes(node):
                 child.parent = node  # type: ignore[attr-defined]
 
-        # Store FunctionDef nodes keyed by mangled sim name.
         seen_raw: Dict[str, int] = {}
         for node in ast.walk(ctx.tree):
             if isinstance(node, ast.FunctionDef):
@@ -243,16 +229,8 @@ class ContextBuilder:
                 seen_raw[node.name] = node.lineno
                 ctx.method_nodes[mangle_sim(node.name)] = node
 
-    # ── Sim-class method signatures ────────────────────────────────────────────
-
     @staticmethod
     def _build_sim_signatures(ctx: ValidationContext, sim_class: type) -> None:
-        """
-        Build method_type_hints / method_return_hints for all sim-class methods.
-        Keys are mangled sim names ("sim_spawn", …).
-        The "self" parameter is intentionally excluded from type_hints for sim
-        methods (it is the simulation object, not a domain pointer).
-        """
         for mangled, node in ctx.method_nodes.items():
             raw_name = node.name
             method = getattr(sim_class, raw_name, None)
@@ -274,12 +252,11 @@ class ContextBuilder:
             else:
                 ctx.method_locations[mangled] = ("<unknown>", 1)
 
-            # AST fallback — guarantees we read exactly what the user wrote.
             clean_hints: Dict[str, Any] = {}
             for arg in node.args.args:
                 arg_name = arg.arg
                 if arg_name == "self":
-                    continue  # exclude self for sim methods
+                    continue
                 if arg_name in param_hints:
                     clean_hints[arg_name] = param_hints[arg_name]
                 elif arg.annotation:
@@ -295,17 +272,12 @@ class ContextBuilder:
             ctx.method_type_hints[mangled]   = clean_hints
             ctx.method_return_hints[mangled] = return_hint
 
-    # ── Domain-class method signatures ────────────────────────────────────────
-
     @staticmethod
     def _build_domain_method_signatures(ctx: ValidationContext) -> None:
-        """
-        Build method_type_hints / method_return_hints for methods defined on
-        domain classes (Cell, Tissue, Chemistry, Metrics).
+        """Build signatures and AST nodes for all domain-class methods.
 
-        Keys are mangled domain names ("cell_update", …).
-        "self" IS included at position 0 with the domain class as its type,
-        mirroring the function-with-pointer convention.
+        AST nodes are stored in ctx.domain_method_nodes keyed by
+        (user_cls, raw_method_name) so CallGraphValidator can walk their bodies.
         """
         for user_cls, base_cls in ctx.memory_base_map.items():
             for raw_method_name in ctx.class_methods.get(user_cls, set()):
@@ -321,6 +293,8 @@ class ContextBuilder:
                 try:
                     ctx.method_signatures[mangled] = inspect.signature(method)
                     param_hints, return_hint = ContextBuilder._resolve_hints(method)
+                    if raw_method_name == "copy" and return_hint is Any:
+                        return_hint = user_cls
                 except (ValueError, TypeError):
                     pass
 
@@ -331,10 +305,24 @@ class ContextBuilder:
                 except (OSError, TypeError):
                     ctx.method_locations[mangled] = ("<unknown>", 1)
 
-                # Build ordered param dict: self first, then the rest.
-                clean_hints: Dict[str, Any] = {}
+                # ── Parse AST for this domain method ──────────────────────────
+                func_node: Optional[ast.FunctionDef] = None
+                try:
+                    raw_func = getattr(method, "__func__", method)
+                    src = textwrap.dedent(inspect.getsource(raw_func))
+                    tree = ast.parse(src)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef):
+                            func_node = node
+                            break
+                except (OSError, TypeError, SyntaxError):
+                    pass
 
-                # Position 0: self — typed as the user domain class (pointer).
+                if func_node is not None:
+                    ctx.domain_method_nodes[(user_cls, raw_method_name)] = func_node
+
+                # ── Build param hints ─────────────────────────────────────────
+                clean_hints: Dict[str, Any] = {}
                 clean_hints["self"] = user_cls
 
                 try:
@@ -345,7 +333,6 @@ class ContextBuilder:
                         if pname in param_hints:
                             clean_hints[pname] = param_hints[pname]
                         elif param.annotation is not inspect.Parameter.empty:
-                            # param.annotation may already be a resolved type
                             ann = param.annotation
                             if isinstance(ann, str):
                                 ann = ANNOTATION_NAMES.get(ann)
@@ -356,8 +343,6 @@ class ContextBuilder:
 
                 ctx.method_type_hints[mangled]   = clean_hints
                 ctx.method_return_hints[mangled] = return_hint
-
-    # ── Class metadata ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _resolve_ast_annotation(ann: ast.expr, ctx: ValidationContext) -> Any:
@@ -511,8 +496,6 @@ class ContextBuilder:
 
         ctx.class_field_types[cls] = field_types
 
-    # ── Constants ──────────────────────────────────────────────────────────────
-
     @staticmethod
     def _build_constants(ctx: ValidationContext) -> None:
         valid_value_types = (int, float, bool, vec3)
@@ -525,8 +508,6 @@ class ContextBuilder:
         for k, v in ctx.sim_instance.__dict__.items():
             if k.isupper() and isinstance(v, valid_value_types):
                 ctx.constants[k] = v
-
-    # ── Method classification ──────────────────────────────────────────────────
 
     @staticmethod
     def _classify_methods(ctx: ValidationContext) -> None:
@@ -553,8 +534,6 @@ class ContextBuilder:
                 return True
         return False
 
-    # ── Generic hint resolver ──────────────────────────────────────────────────
-
     @staticmethod
     def _resolve_hints(func: Any) -> Tuple[Dict[str, Any], Optional[Any]]:
         try:
@@ -562,4 +541,10 @@ class ContextBuilder:
         except Exception:
             hints = getattr(func, "__annotations__", {}).copy()
         return_type = hints.pop("return", None)
+        if return_type is type(None):
+            return_type = None
+        if return_type is not None:
+            tt = resolve_tuple_annotation(return_type)
+            if tt is not None:
+                return_type = tt
         return hints, return_type

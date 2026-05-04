@@ -4,7 +4,8 @@ import ast
 
 from ._expr_translator import ExprTranslator
 from ._context import TranslationContext
-from oncolytica.gpu.compiler._type_system import wgsl_zero
+from oncolytica.gpu.compiler._type_system import wgsl_zero, py_type_to_wgsl
+from oncolytica.core.validation._context import TupleType
 from ._constants import _AUGOP_MAP
 
 
@@ -47,6 +48,53 @@ class StmtTranslator(ast.NodeVisitor):
         target     = node.targets[0]
         value_node = node.value
 
+        # ── Tuple unpacking: a, b = func() ───────────────────────────────────
+        if isinstance(target, ast.Tuple):
+            # Primary: type_map is populated by TypeChecker for helper bodies.
+            tuple_type = self.ctx.val_ctx.type_map.get(id(value_node))
+
+            # Fallback: rule bodies are NOT visited by TypeChecker, so type_map
+            # has no entry for the call node.  Resolve the TupleType directly
+            # from method_return_hints using the callee's mangled name.
+            if tuple_type is None and isinstance(value_node, ast.Call):
+                fn = value_node.func
+                if (isinstance(fn, ast.Attribute)
+                        and isinstance(fn.value, ast.Name)
+                        and fn.value.id == "self"):
+                    # self.method() inside a rule → mangled as "sim_method"
+                    mangled = f"sim_{fn.attr}"
+                    tuple_type = self.ctx.val_ctx.method_return_hints.get(mangled)
+                elif (isinstance(fn, ast.Attribute)
+                        and not (isinstance(fn.value, ast.Name)
+                                 and fn.value.id == "self")):
+                    # obj.method() → mangled as "BaseClass_method"
+                    obj_py_type = self.ctx.val_ctx.type_map.get(id(fn.value))
+                    if obj_py_type is not None:
+                        base = self.ctx.val_ctx.get_base_class(obj_py_type)
+                        if base is not None:
+                            mangled = f"{base.__name__}_{fn.attr}"
+                            tuple_type = self.ctx.val_ctx.method_return_hints.get(mangled)
+
+            tmp_name = self.ctx.fresh_tmp("_tuple_")
+            rhs_str = self._expr_str(value_node)
+
+            if tuple_type is not None and hasattr(tuple_type, 'wgsl_name'):
+                wgsl_type = tuple_type.wgsl_name()
+                # Register in local_vars so get_output() hoists:
+                #   var _tuple_N: Tuple_T1_T2;
+                # Then emit a plain assignment here (no inline var/let).
+                self.ctx.local_vars[tmp_name] = wgsl_type
+                self.ctx.emit(f"{tmp_name} = {rhs_str};", node.lineno)
+            else:
+                # Should not normally happen — TupleType not found at all.
+                self.ctx.local_vars[tmp_name] = "i32"
+                self.ctx.emit(f"{tmp_name} = {rhs_str};", node.lineno)
+
+            for i, elt in enumerate(target.elts):
+                if isinstance(elt, ast.Name):
+                    self.ctx.tuple_aliases[elt.id] = f"{tmp_name}.get_{i}"
+            return
+
         # ── Domain class constructor with keyword args: x = MyCell(pos=…) ────
         #    Matches any registered domain class, not just main_class, so that
         #    helpers can construct any domain type (e.g. MyTissue(oxygen=0.5)).
@@ -87,6 +135,17 @@ class StmtTranslator(ast.NodeVisitor):
         # No special path needed here.
         if isinstance(target, ast.Name):
             var_name = target.id
+            if var_name in self.ctx.tuple_aliases:
+                alias_path = self.ctx.tuple_aliases[var_name]
+                local_type = self._infer_type(target)
+                value_str = (
+                    self._expr.translate_as(value_node, local_type)
+                    if local_type
+                    else self._expr_str(value_node)
+                )
+                self.ctx.emit(f"{alias_path} = {value_str};", node.lineno)
+                return
+
             is_param = var_name in self.ctx.method_params
             if not is_param and var_name not in self.ctx.local_vars:
                 inferred = self._infer_type(value_node)
@@ -126,7 +185,7 @@ class StmtTranslator(ast.NodeVisitor):
         _ANN_MAP: dict[str, str] = {
             "f32": "f32", "i32": "i32", "u32": "u32",
             "float": "f32", "int": "i32", "bool": "i32",
-            "vec3": "vec3<f32>",
+            "vec3": "vec3<f32>", "ivec3": "vec3<i32>",
         }
 
         wgsl_type: str | None = None
@@ -149,7 +208,14 @@ class StmtTranslator(ast.NodeVisitor):
             val_str = self._expr.translate_as(node.value, wgsl_type)
             self.ctx.emit(f"{var_name} = {val_str};", node.lineno)
         else:
-            self.ctx.emit(f"{var_name} = {wgsl_zero(wgsl_type)};", node.lineno)
+            # wgsl_zero covers scalars; vec types need a constructor literal.
+            _VEC_ZERO: dict[str, str] = {
+                "vec3<f32>": "vec3<f32>(0.0, 0.0, 0.0)",
+                "vec3<i32>": "vec3<i32>(0, 0, 0)",
+                "vec3<u32>": "vec3<u32>(0u, 0u, 0u)",
+            }
+            zero = _VEC_ZERO.get(wgsl_type) or wgsl_zero(wgsl_type)
+            self.ctx.emit(f"{var_name} = {zero};", node.lineno)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         op = _AUGOP_MAP.get(type(node.op))
@@ -288,8 +354,25 @@ class StmtTranslator(ast.NodeVisitor):
 
         if node.value is None:
             self.ctx.emit("return;", node.lineno)
-        else:
-            self.ctx.emit(f"return {self._expr_str(node.value)};", node.lineno)
+            return
+
+        # return x, y  →  return Tuple_T1_T2(x, y)
+        # The syntax validator guarantees ast.Tuple here only occurs in returns.
+        if isinstance(node.value, ast.Tuple):
+            rhs_py_type = self.ctx.val_ctx.type_map.get(id(node.value))
+            if isinstance(rhs_py_type, TupleType):
+                struct_name = rhs_py_type.wgsl_name()
+                elems = ", ".join(
+                    self._expr.translate_as(elt, py_type_to_wgsl(elem_type))
+                    for elt, elem_type in zip(node.value.elts, rhs_py_type.elements)
+                )
+                self.ctx.emit(f"return {struct_name}({elems});", node.lineno)
+                return
+            # Fallback should not be reached with a correct compiler pipeline.
+            # Raising an error is safer than generating invalid code.
+            raise ValueError("Internal compiler error: untyped tuple in return statement.")
+
+        self.ctx.emit(f"return {self._expr_str(node.value)};", node.lineno)
 
     def visit_Pass(self, node: ast.Pass) -> None:
         self.ctx.emit("// pass", node.lineno)

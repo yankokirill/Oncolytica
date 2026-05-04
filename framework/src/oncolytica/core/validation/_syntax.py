@@ -12,7 +12,7 @@ from oncolytica.core.utils._types import (  # noqa: E402
 
 from oncolytica.core.utils._errors import CompilationError
 from ._base import BaseValidator
-from ._context import ValidationContext, RULE_DECORATOR_NAMES
+from ._context import ValidationContext, RULE_DECORATOR_NAMES, TupleType, resolve_tuple_annotation
 
 
 # ============================================================================
@@ -27,6 +27,7 @@ class SyntaxValidator(BaseValidator):
     def __init__(self) -> None:
         super().__init__()
         self._classdef_depth: int = 0
+        self._in_annotation: bool = False
 
     def visit_Import(self, node: ast.Import) -> None:
         raise CompilationError(f"'import' statements are forbidden inside a Simulation class.", node=node)
@@ -70,6 +71,29 @@ class SyntaxValidator(BaseValidator):
             self.visit(stmt)
         self._classdef_depth -= 1
 
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # Visit the return annotation (node.returns) in annotation context.
+        if node.returns is not None:
+            self._in_annotation = True
+            self.visit(node.returns)
+            self._in_annotation = False
+        # Visit args (annotations handled in visit_arg below).
+        for arg in node.args.args:
+            self.visit(arg)
+        # Visit decorators and body normally.
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for stmt in node.body:
+            self.visit(stmt)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        # Visit the parameter annotation in annotation context so that
+        # tuple[f32, i32] slices (ast.Tuple inside ast.Subscript) are allowed.
+        if node.annotation is not None:
+            self._in_annotation = True
+            self.visit(node.annotation)
+            self._in_annotation = False
+
     def visit_Lambda(self, node: ast.Lambda) -> None:
         raise CompilationError(f"Lambda expressions are forbidden.", node=node)
 
@@ -86,10 +110,51 @@ class SyntaxValidator(BaseValidator):
         raise CompilationError(f"List literals are forbidden.", node=node)
 
     def visit_Tuple(self, node: ast.Tuple) -> None:
+        # Allowed in annotation context: tuple[f32, i32] slice.
+        if self._in_annotation:
+            return
+        # Tuple nodes on the LHS of an unpacking assignment are allowed:
+        #   a, b = func()
+        # All other tuple literals (RHS, nested, standalone) remain forbidden.
+        # LHS tuples are identified by their Store context.
+        if isinstance(node.ctx, ast.Store):
+            # Validate that every element is a plain Name (no nested tuples).
+            for elt in node.elts:
+                if not isinstance(elt, ast.Name):
+                    raise CompilationError(
+                        f"Only simple names are allowed in tuple unpacking targets "
+                        f"(e.g. 'a, b = func()'). Nested unpacking is forbidden.",
+                        node=node,
+                    )
+            return  # valid — let generic_visit recurse into children
         raise CompilationError(
-            f"Tuples are forbidden. "
-            f"Tuple unpacking is not supported – use individual variables, vec3 or ivec3.", node=node
+            f"Tuple literals are forbidden. "
+            f"To unpack a function return value use: a, b = func(). "
+            f"For vectors use vec3 or ivec3.", node=node
         )
+
+    def visit_Return(self, node: ast.Return) -> None:
+        # return x, y  produces ast.Return(value=ast.Tuple(ctx=Load)).
+        # This is the only place where a Load-context Tuple is allowed —
+        # it represents a multi-value return, not a stored tuple literal.
+        # We validate the elements individually instead of letting
+        # generic_visit fall into visit_Tuple which would reject them.
+        if isinstance(node.value, ast.Tuple):
+            if not isinstance(node.value.ctx, ast.Load):
+                raise CompilationError(
+                    "Only 'return x, y' form is allowed for multi-value returns.",
+                    node=node,
+                )
+            for elt in node.value.elts:
+                if isinstance(elt, ast.Tuple):
+                    raise CompilationError(
+                        "Nested tuples in return values are forbidden.",
+                        node=node,
+                    )
+                self.visit(elt)
+            return  # do NOT call generic_visit — that would hit visit_Tuple
+        # Single-value or bare return — visit normally.
+        self.generic_visit(node)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         raise CompilationError(f"List comprehensions are forbidden.", node=node)
@@ -106,8 +171,9 @@ class SyntaxValidator(BaseValidator):
     def visit_Assign(self, node: ast.Assign) -> None:
         if len(node.targets) > 1:
             raise CompilationError(f"Cascading assignment (a = b = c) is forbidden.", node=node)
-        if isinstance(node.targets[0], (ast.Tuple, ast.List)):
-            raise CompilationError(f"Tuple/List-unpacking assignment is forbidden.", node=node)
+        if isinstance(node.targets[0], ast.List):
+            raise CompilationError(f"List-unpacking assignment is forbidden.", node=node)
+        # ast.Tuple on the LHS is tuple unpacking — validated in visit_Tuple.
         self.generic_visit(node)
 
     def visit_Compare(self, node: ast.Compare) -> None:
@@ -215,6 +281,11 @@ class SignatureValidator(BaseValidator):
             method: str,
     ) -> None:
         if t in PRIMITIVE_TYPES:
+            return
+        if isinstance(t, TupleType):
+            # Each element must itself be a valid primitive or domain type.
+            for elem in t.elements:
+                self._assert_valid_annotation(elem, node, param, method)
             return
         if isinstance(t, type) and any(issubclass(t, b) for b in BASE_CLASSES):
             return
