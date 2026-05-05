@@ -111,7 +111,7 @@ class AgentList:
 
     # ── compaction ────────────────────────────────────────────────────────────
 
-    def remove_dead(self) -> int:
+    def _remove_dead(self) -> int:
         before = len(self._data)
         self._data = [a for a in self._data if getattr(a, "_alive", True)]
         return before - len(self._data)

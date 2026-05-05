@@ -139,8 +139,10 @@ def _compile_helper_fn(
         if is_domain and is_mutating:
             wgsl_params.append(f"{pname}: ptr<function, {wgsl_type}>")
         elif is_primitive and is_mutating:
-            wgsl_params.append(f"_{pname}: {wgsl_type}")
+            wgsl_params.append(f"{pname}: {wgsl_type}")
             mutable_primitive_params.append((pname, wgsl_type))
+        elif ann is bool:
+            wgsl_params.append(f"{pname}: i32")
         else:
             wgsl_params.append(f"{pname}: {wgsl_type}")
 
@@ -265,6 +267,9 @@ class WGSLCompiler:
                 warnings.warn(f"Could not compile Simulation helper '{name}': {exc}")
 
         # ── Domain-class helpers  (prefix_method_name) ────────────────────────
+        # Build a lookup: mangled_name → (cls, unbound_function) for all
+        # user-defined domain methods (excluding framework internals).
+        _domain_cls_map: dict[str, tuple[type, Any]] = {}
         domain_classes = [
             self._spec.cell_class,
             self._spec.tissue_class,
@@ -276,7 +281,6 @@ class WGSLCompiler:
             if base is None:
                 continue
             prefix = base.__name__.lower()
-
             for name, val in inspect.getmembers(cls, predicate=inspect.isfunction):
                 if name.startswith("_"):
                     continue
@@ -284,21 +288,35 @@ class WGSLCompiler:
                     continue
                 if any(name in vars(b) for b in BASE_CLASSES if b is not object):
                     continue
-                try:
-                    mangled_name = f"{prefix}_{name}"
-                    wgsl_fn, constants = _compile_helper_fn(
-                        val,
-                        func_def=None,
-                        uniforms_map=uniforms_map,
-                        val_ctx=self.val_ctx,
-                        wgsl_fn_name=mangled_name,
-                        main_param="_self",
-                        main_class=cls,
-                    )
-                    all_constants.update(constants)
-                    self.builder.add_helper_fn(wgsl_fn)
-                except Exception as exc:
-                    warnings.warn(f"Could not compile {prefix} helper '{name}': {exc}")
+                mangled_name = f"{prefix}_{name}"
+                _domain_cls_map[mangled_name] = (cls, val)
+
+        # Emit in topological order so callees always precede callers in WGSL.
+        _sim_method_names = set(self.val_ctx.method_nodes.keys())
+        for mangled_name in self.val_ctx.ordered_methods:
+            if mangled_name in _sim_method_names:
+                continue  # sim-methods are emitted separately above
+            if mangled_name not in _domain_cls_map:
+                continue  # framework internal (copy, die, …) — skip
+            cls, val = _domain_cls_map[mangled_name]
+            base = domain_base_of(cls)
+            prefix = base.__name__.lower() if base else cls.__name__.lower()
+            name = mangled_name[len(prefix) + 1:]
+            try:
+                wgsl_fn, constants = _compile_helper_fn(
+                    val,
+                    func_def=self.val_ctx.domain_method_nodes.get((cls, name)),
+                    uniforms_map=uniforms_map,
+                    val_ctx=self.val_ctx,
+                    wgsl_fn_name=mangled_name,
+                    main_param="_self",
+                    main_class=cls,
+                )
+                all_constants.update(constants)
+                self.builder.add_helper_fn(wgsl_fn)
+            except Exception as exc:
+                import traceback
+                warnings.warn(f"Could not compile {prefix} helper '{name}': {exc}\n{traceback.format_exc()}")
 
         # ── Cell rules ────────────────────────────────────────────────────────
         for idx, rule in enumerate(self.engine._cell_rules):

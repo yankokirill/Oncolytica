@@ -67,12 +67,28 @@ class StmtTranslator(ast.NodeVisitor):
                 elif (isinstance(fn, ast.Attribute)
                         and not (isinstance(fn.value, ast.Name)
                                  and fn.value.id == "self")):
-                    # obj.method() → mangled as "BaseClass_method"
+                    # obj.method() → mangled as "prefix_method"
+                    # Primary: look up receiver type from type_map (works for
+                    # helper bodies where TypeChecker has run).
                     obj_py_type = self.ctx.val_ctx.type_map.get(id(fn.value))
+                    # Fallback: rule bodies are not visited by TypeChecker, so
+                    # resolve the receiver type from the current method's hints
+                    # using the variable name.
+                    if obj_py_type is None and isinstance(fn.value, ast.Name):
+                        obj_name = fn.value.id
+                        current_mangled = (
+                            f"sim_{self.ctx.method_name}"
+                            if self.ctx.is_rule or self.ctx.main_class is None
+                            else f"{self.ctx.main_wgsl_struct.lower()}_{self.ctx.method_name}"
+                            if self.ctx.main_wgsl_struct
+                            else f"sim_{self.ctx.method_name}"
+                        )
+                        hints = self.ctx.val_ctx.method_type_hints.get(current_mangled, {})
+                        obj_py_type = hints.get(obj_name)
                     if obj_py_type is not None:
                         base = self.ctx.val_ctx.get_base_class(obj_py_type)
                         if base is not None:
-                            mangled = f"{base.__name__}_{fn.attr}"
+                            mangled = f"{base.__name__.lower()}_{fn.attr}"
                             tuple_type = self.ctx.val_ctx.method_return_hints.get(mangled)
 
             tmp_name = self.ctx.fresh_tmp("_tuple_")
@@ -372,7 +388,24 @@ class StmtTranslator(ast.NodeVisitor):
             # Raising an error is safer than generating invalid code.
             raise ValueError("Internal compiler error: untyped tuple in return statement.")
 
-        self.ctx.emit(f"return {self._expr_str(node.value)};", node.lineno)
+        # Look up the declared return type and cast if necessary
+        # (e.g. `return true` in an i32-returning function).
+        ret_wgsl: str | None = None
+        fn_name = self.ctx.val_ctx.method_return_hints.get(
+            f"sim_{self.ctx.method_name}"
+            if self.ctx.is_rule or self.ctx.main_class is None
+            else f"{(self.ctx.main_wgsl_struct or '').lower()}_{self.ctx.method_name}"
+        )
+        if fn_name is not None:
+            try:
+                from oncolytica.gpu.compiler._type_system import py_type_to_wgsl as _p2w
+                ret_wgsl = _p2w(fn_name)
+            except (TypeError, ImportError):
+                pass
+        if ret_wgsl is not None:
+            self.ctx.emit(f"return {self._expr.translate_as(node.value, ret_wgsl)};", node.lineno)
+        else:
+            self.ctx.emit(f"return {self._expr_str(node.value)};", node.lineno)
 
     def visit_Pass(self, node: ast.Pass) -> None:
         self.ctx.emit("// pass", node.lineno)

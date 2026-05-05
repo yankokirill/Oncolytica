@@ -723,3 +723,5 @@ ANNOTATION_NAMES = {
     "int": int,
     "float": float,
 }
+
+# TODO: Generics for hints only

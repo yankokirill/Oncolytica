@@ -344,7 +344,7 @@ class GpuBackend(ISimulationBackend):
         for name, ftype in hints.items():
             val = getattr(params, name, None)
             if ftype in _BOOL_TYPES or isinstance(val, bool):
-                self._user_params[name] = ("u32", int(bool(val)))
+                self._user_params[name] = ("i32", int(bool(val)))
             elif ftype in _FLOAT_TYPES or isinstance(val, float):
                 self._user_params[name] = ("f32", float(val))
             elif ftype in _INT_TYPES or isinstance(val, int):

@@ -1,160 +1,162 @@
-import time
 import matplotlib.pyplot as plt
-from gbm_model import build_simulation  # Импортируем вашу функцию сборки модели
+from gbm_model import build_simulation
 
 DAYS_TO_HOURS = 24
 
 
-def run_simulation(engine, model, days, ap_day=None, am_day=None):
-    """
-    Запускает симуляцию на заданное количество дней.
-    Возвращает словарь с историей метрик.
-    """
-    history = {
-        'day': [],
-        'tumor_burden': [],
-        'infected': [],
-        'recruited': []
-    }
+def run_simulation(engine, days, ap_day=None, am_day=None):
+    history = {'day': [], 'tumor_burden': [], 'infected': [], 'recruited': []}
 
     for h in range(1, days * DAYS_TO_HOURS + 1):
-        # Включение терапии
         if ap_day and h == ap_day * DAYS_TO_HOURS:
-            model.params.treatment_ap = True
-            print(f"   [Day {ap_day}] Anti-Proliferative treatment STARTED")
+            engine.update_params(treatment_ap=True)
         if am_day and h == am_day * DAYS_TO_HOURS:
-            model.params.treatment_am = True
-            print(f"   [Day {am_day}] Anti-Migratory treatment STARTED")
+            engine.update_params(treatment_am=True)
 
-        # Собираем метрики раз в сутки
         collect = (h % DAYS_TO_HOURS == 0)
         engine.run_step(collect_metrics=collect)
 
         if collect:
             day = h // DAYS_TO_HOURS
-            metrics = engine.get_metrics()
-
-            # Простая метрика массы опухоли вместо геометрического диаметра
-            tumor_burden = metrics.infected_count + metrics.recruited_count
-
+            m = engine.get_metrics()
             history['day'].append(day)
-            history['tumor_burden'].append(tumor_burden)
-            history['infected'].append(metrics.infected_count)
-            history['recruited'].append(metrics.recruited_count)
+            history['tumor_burden'].append(m.infected_count + m.recruited_count)
+            history['infected'].append(m.infected_count)
+            history['recruited'].append(m.recruited_count)
 
-    return history
+    cells_x_inf, cells_y_inf = [], []
+    cells_x_rec, cells_y_rec = [], []
+    engine.sync_to_host()
+    for c in engine.cells:
+        if c.cell_type == 1:
+            cells_x_inf.append(c.pos.x)
+            cells_y_inf.append(c.pos.y)
+        elif c.cell_type == 2:
+            cells_x_rec.append(c.pos.x)
+            cells_y_rec.append(c.pos.y)
+
+    spatial_data = (cells_x_inf, cells_y_inf, cells_x_rec, cells_y_rec)
+    return history, spatial_data
+
+
+def plot_spatial(ax, spatial_data, title):
+    x_inf, y_inf, x_rec, y_rec = spatial_data
+    ax.scatter(x_rec, y_rec, c='red', s=2, alpha=0.5, label='Recruited')
+    ax.scatter(x_inf, y_inf, c='green', s=2, alpha=0.5, label='Infected')
+    ax.set_xlim(0, 600)
+    ax.set_ylim(0, 600)
+    ax.set_title(title)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.legend(loc='lower right', markerscale=3, fontsize=7)
 
 
 def run_all_experiments():
-    print("\n=== Oncolytica GBM: Replicating Gallaher et al. ===")
+    print("=== Oncolytica GBM: Replicating Gallaher et al. ===")
 
-    # ---------------------------------------------------------
-    # 1. Benchmark CPU vs GPU
-    # ---------------------------------------------------------
-    print("\n1. Running Benchmark (5 Days)...")
+    # 1. Базовый рост (17 дней)
+    print("\n1. Running Baseline Growth (17 Days)...")
+    eng_dyn = build_simulation(seed=100)
+    hist_dyn, spatial_dyn = run_simulation(eng_dyn, days=17)
+    print(f"   Day 17 | Infected: {hist_dyn['infected'][-1]}  "
+          f"Recruited: {hist_dyn['recruited'][-1]}  "
+          f"Total: {hist_dyn['tumor_burden'][-1]}")
 
-    t0 = time.perf_counter()
-    eng_cpu, mod_cpu = build_simulation(backend="cpu", seed=42)
-    run_simulation(eng_cpu, mod_cpu, days=5)
-    t_cpu = time.perf_counter() - t0
-    print(f"   CPU Time: {t_cpu:.2f} s")
-
-    t0 = time.perf_counter()
-    eng_gpu, mod_gpu = build_simulation(backend="gpu", seed=42)
-    run_simulation(eng_gpu, mod_gpu, days=5)
-    t_gpu = time.perf_counter() - t0
-    print(f"   GPU Time: {t_gpu:.2f} s")
-
-    if t_gpu > 0:
-        print(f"   🚀 GPU Speedup: {t_cpu / t_gpu:.1f}x")
-
-    # ---------------------------------------------------------
-    # 2. Growth Dynamics (Fig 3 & 4 replication)
-    # ---------------------------------------------------------
-    print("\n2. Validating Baseline Growth Dynamics (17 Days)...")
-    eng_dyn, mod_dyn = build_simulation(backend="gpu", seed=100)
-    hist_dyn = run_simulation(eng_dyn, mod_dyn, days=17)
-
-    print(f"   Day  5 Cells: {hist_dyn['tumor_burden'][4]}")
-    print(f"   Day 10 Cells: {hist_dyn['tumor_burden'][9]}")
-    print(
-        f"   Day 17 Cells: {hist_dyn['tumor_burden'][16]} (Infected: {hist_dyn['infected'][16]}, Recruited: {hist_dyn['recruited'][16]})")
-
-    # ---------------------------------------------------------
-    # 3. Treatment Comparisons (Fig 5 & 9 replication)
-    # ---------------------------------------------------------
-    print("\n3. Testing Therapies (28 Days total, Treatment starts at Day 14)...")
+    # 2. Четыре режима терапии (28 дней, старт с дня 14)
+    print("\n2. Testing Therapies (start at Day 14)...")
     treatments = [
-        ("Control", None, None),
-        ("AP Only", 14, None),
-        ("AM Only", None, 14),
-        ("AP+AM", 14, 14)
+        ("Control",        None, None),
+        ("AP Only",        14,   None),
+        ("AM Only",        None, 14),
+        ("AP+AM (Combo)",  14,   14),
     ]
 
     histories = {}
+    spatials = {}
+    colors = {
+        "Control":       'gray',
+        "AP Only":       '#4a9eda',
+        "AM Only":       '#e06c75',
+        "AP+AM (Combo)": '#c678dd',
+    }
+
     for name, ap_d, am_d in treatments:
-        print(f"\n   Running scenario: {name}")
-        eng_tx, mod_tx = build_simulation(backend="gpu", seed=42)
-        hist_tx = run_simulation(eng_tx, mod_tx, days=28, ap_day=ap_d, am_day=am_d)
+        print(f"  -> {name}")
+        eng_tx = build_simulation(seed=42)
+        hist, spat = run_simulation(eng_tx, days=28, ap_day=ap_d, am_day=am_d)
+        histories[name] = hist
+        spatials[name] = spat
+        print(f"     Day 28 burden: {hist['tumor_burden'][-1]}")
 
-        histories[name] = hist_tx
+    # 3. Рисуем
+    print("\n3. Generating plots...")
+    import numpy as np
+    fig = plt.figure(figsize=(18, 12))
+    fig.suptitle("GBM Agent-Based Model · Gallaher et al. (2020) Replication",
+                 fontsize=13, fontweight='bold', y=0.98)
 
-        d14_burden = hist_tx['tumor_burden'][13]
-        d28_burden = hist_tx['tumor_burden'][27]
-        print(f"   [{name}] Tumor cells: {d14_burden} (Day 14) -> {d28_burden} (Day 28)")
+    # A: базовая динамика
+    ax1 = fig.add_subplot(2, 4, 1)
+    ax1.plot(hist_dyn['day'], hist_dyn['tumor_burden'], 'k-',  lw=2, label='Total active')
+    ax1.plot(hist_dyn['day'], hist_dyn['recruited'],    'r--', lw=1.5, label='Recruited')
+    ax1.plot(hist_dyn['day'], hist_dyn['infected'],     'g--', lw=1.5, label='Infected')
+    ax1.set_yscale('log')
+    ax1.set_title('A  Tumor growth dynamics\n(Fig 3 & 4)', fontsize=9)
+    ax1.set_xlabel('Days'); ax1.set_ylabel('Cell count (log)')
+    ax1.legend(fontsize=7)
 
-    # ---------------------------------------------------------
-    # 4. Generating Plots
-    # ---------------------------------------------------------
-    print("\n4. Generating plots (validation_results.png)...")
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    # B: I/R ratio
+    ax2 = fig.add_subplot(2, 4, 2)
+    ir = [i / max(r, 1) for i, r in zip(hist_dyn['infected'], hist_dyn['recruited'])]
+    ax2.plot(hist_dyn['day'], ir, color='#f0a500', lw=2)
+    ax2.axhline(1.0, color='gray', lw=0.8, linestyle=':')
+    ax2.set_title('B  Infected / Recruited ratio\n(Fig 4B)', fontsize=9)
+    ax2.set_xlabel('Days'); ax2.set_ylabel('I / R')
+    ax2.set_ylim(bottom=0)
 
-    # A: Performance
-    axs[0, 0].bar(['CPU', 'GPU'], [t_cpu, t_gpu], color=['#ff9999', '#66b3ff'])
-    axs[0, 0].set_title('A. Performance Benchmark (5 days)')
-    axs[0, 0].set_ylabel('Execution Time (seconds)')
-    for i, v in enumerate([t_cpu, t_gpu]):
-        axs[0, 0].text(i, v + (max(t_cpu, t_gpu) * 0.02), f"{v:.1f}s", ha='center')
-
-    # B: Growth Dynamics (Recruited vs Infected)
-    axs[0, 1].plot(hist_dyn['day'], hist_dyn['tumor_burden'], 'k-', lw=2, label='Total Tumor Cells')
-    axs[0, 1].plot(hist_dyn['day'], hist_dyn['recruited'], 'r--', lw=2, label='Recruited Cells')
-    axs[0, 1].plot(hist_dyn['day'], hist_dyn['infected'], 'g--', lw=2, label='Infected Cells')
-    axs[0, 1].set_title('B. Tumor Growth Dynamics (Fig 3 & 4)')
-    axs[0, 1].set_xlabel('Days')
-    axs[0, 1].set_ylabel('Cell Count')
-    axs[0, 1].legend()
-
-    # C: Therapy Dynamics
-    colors = {'Control': 'gray', 'AP Only': 'blue', 'AM Only': 'orange', 'AP+AM': 'purple'}
+    # C: сравнение терапий
+    ax3 = fig.add_subplot(2, 4, 3)
     for name, hist in histories.items():
-        axs[1, 0].plot(hist['day'], hist['tumor_burden'], label=name, color=colors[name], lw=2)
+        ax3.plot(hist['day'], hist['tumor_burden'],
+                 label=name, color=colors[name], lw=2)
+    ax3.axvline(14, color='red', linestyle=':', lw=1.2, label='Therapy start')
+    ax3.set_title('C  Treatment responses\n(Fig 5 & 9)', fontsize=9)
+    ax3.set_xlabel('Days'); ax3.set_ylabel('Active cell count')
+    ax3.legend(fontsize=7)
 
-    axs[1, 0].axvline(14, color='red', linestyle=':', label='Therapy Start')
-    axs[1, 0].set_title('C. Treatment Responses (Fig 5 & 9)')
-    axs[1, 0].set_xlabel('Days')
-    axs[1, 0].set_ylabel('Tumor Cell Count')
-    axs[1, 0].legend()
+    # D: Ki67-прокси
+    ax4 = fig.add_subplot(2, 4, 4)
+    tx_idx = 13  # день 14 → индекс 13
+    names_ki = ["Control", "AP Only", "AP+AM (Combo)"]
+    pre  = [histories[n]['infected'][tx_idx] / max(histories[n]['tumor_burden'][tx_idx], 1) * 100
+            for n in names_ki]
+    post = [histories[n]['infected'][-1]     / max(histories[n]['tumor_burden'][-1], 1)     * 100
+            for n in names_ki]
+    x = np.arange(len(names_ki))
+    w = 0.35
+    b1 = ax4.bar(x - w/2, pre,  w, label='Day 14 (pre-tx)',  color='#4a9eda', alpha=0.85)
+    b2 = ax4.bar(x + w/2, post, w, label='Day 28 (post-tx)', color='#e06c75', alpha=0.85)
+    ax4.set_xticks(x)
+    ax4.set_xticklabels([n.replace(' ', '\n') for n in names_ki], fontsize=8)
+    ax4.set_title('D  Infected fraction (Ki67 proxy)\n(Fig 8)', fontsize=9)
+    ax4.set_ylabel('% of active cells')
+    ax4.legend(fontsize=7)
+    for bar in list(b1) + list(b2):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                 f'{bar.get_height():.0f}%', ha='center', va='bottom', fontsize=7)
 
-    # D: Therapy Delta (Bar chart of change from day 14 to 28)
-    names = list(histories.keys())
-    deltas = [histories[n]['tumor_burden'][27] - histories[n]['tumor_burden'][13] for n in names]
+    # E–H: пространственные карты
+    spatial_order = ["Control", "AP Only", "AM Only", "AP+AM (Combo)"]
+    subplot_letters = 'EFGH'
+    for idx, name in enumerate(spatial_order):
+        ax = fig.add_subplot(2, 4, 5 + idx)
+        ax.set_facecolor('#080808')
+        plot_spatial(ax, spatials[name], f'{subplot_letters[idx]}  {name}\n(Day 28)')
 
-    bars = axs[1, 1].bar(names, deltas, color=[colors[n] for n in names])
-    axs[1, 1].axhline(0, color='black', linewidth=1)
-    axs[1, 1].set_title('D. Change in Tumor Burden (Day 14 -> 28)')
-    axs[1, 1].set_ylabel('Δ Cell Count')
-
-    # Add values on top of bars
-    for bar in bars:
-        yval = bar.get_height()
-        offset = 100 if yval >= 0 else -100
-        axs[1, 1].text(bar.get_x() + bar.get_width() / 2, yval + offset, int(yval), ha='center',
-                       va='bottom' if yval >= 0 else 'top')
-
-    plt.tight_layout()
-    plt.savefig('validation_results.png', dpi=300)
-    print("   ✅ Saved 'validation_results.png'. Done!")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    out = 'gbm_results.png'
+    plt.savefig(out, dpi=200, bbox_inches='tight')
+    print(f"Done! Saved: {out}")
 
 
 if __name__ == "__main__":

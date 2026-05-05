@@ -65,7 +65,7 @@ class Engine:
         for name, value in kwargs.items():
             self._sim._params._validate_field(name, value)
         for name, value in kwargs.items():
-            self._sim._params.__setattr__(name, value)
+            object.__setattr__(self._sim._params, name, value)
 
 
     def setup_geometry(

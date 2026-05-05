@@ -175,7 +175,6 @@ class GBMCell(CellBase):
             u1: ol.f32 = ol.math.clamp(ol.random(), 0.0001, 1.0)
             u2: ol.f32 = ol.random()
             z: ol.f32 = ol.math.sqrt(-2.0 * ol.math.log(u1)) * ol.math.cos(TWO_PI * u2)
-            # Явная аннотация типа исправляет ошибку трансляции atan2 -> i32
             base: ol.f32 = ol.math.atan2(tissue.tract_dir_y, tissue.tract_dir_x)
             return base + z * 0.52359877
         return ol.random() * TWO_PI
@@ -229,9 +228,7 @@ class MultiscaleGBM(ol.Simulation[BrainTissue, BrainChem, GBMCell, GBMMetrics, P
             cell.try_activate(c_pp)
             return
 
-        p: ol.f32
-        m: ol.f32
-        p, m = cell.compute_phenotype(c_pp, apply_am=self.params.treatment_am)
+        p, m = cell.compute_phenotype(c_pp, self.params.treatment_am)
 
         active_neighbors: ol.i32 = 0
         for nb in cell.neighbors:
@@ -286,14 +283,20 @@ def _init_chemistry(engine: ol.Engine):
 
 
 def _init_cells(engine: ol.Engine):
-    for _ in range(10):
-        x: float = max(0.0, min(599.9, 300.0 + random.gauss(0, 5.0)))
-        y: float = max(0.0, min(599.9, 300.0 + random.gauss(0, 5.0)))
+    # Разносим по разным вокселям (шаг 15 мкм = 1 воксель), чтобы не упираться
+    # в carrying_capacity сразу — иначе все клетки quiescent с первого шага
+    for k in range(10):
+        offset_x = (k % 5) * 15.0 - 30.0
+        offset_y = (k // 5) * 15.0 - 7.5
+        x: float = max(0.0, min(599.9, 300.0 + offset_x + random.gauss(0, 2.0)))
+        y: float = max(0.0, min(599.9, 300.0 + offset_y + random.gauss(0, 2.0)))
         engine.cells.add(GBMCell(pos=ol.vec3(x, y, 7.5), cell_type=TYPE_INFECTED, p_pot=0.025, m_pot=0.217))
 
-    for _ in range(10):
-        x: float = max(0.0, min(599.9, 300.0 + random.gauss(0, 10.0)))
-        y: float = max(0.0, min(599.9, 300.0 + random.gauss(0, 10.0)))
+    for k in range(10):
+        offset_x = (k % 5) * 15.0 - 30.0
+        offset_y = (k // 5) * 15.0 + 7.5
+        x: float = max(0.0, min(599.9, 300.0 + offset_x + random.gauss(0, 2.0)))
+        y: float = max(0.0, min(599.9, 300.0 + offset_y + random.gauss(0, 2.0)))
         engine.cells.add(GBMCell(pos=ol.vec3(x, y, 7.5), cell_type=TYPE_RECRUITED, p_pot=0.028, m_pot=0.25))
 
     for _ in range(int(40 * 40 * 0.05)):
@@ -315,4 +318,4 @@ def build_simulation(seed: int = 42, backend: str = "gpu"):
 
     model = MultiscaleGBM()
     engine.load_model(model)
-    return engine, model
+    return engine

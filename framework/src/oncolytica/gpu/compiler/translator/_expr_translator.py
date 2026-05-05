@@ -162,6 +162,19 @@ class ExprTranslator(ast.NodeVisitor):
             return f"!({self.translate_as(node.operand, 'bool')})"
         raise CompilationError(f"Unsupported unary op {type(node.op).__name__}")
 
+    def visit_IfExp(self, node: ast.IfExp) -> str:
+        """Translate Python ternary  `body if test else orelse`  →  WGSL `select(orelse, body, test)`.
+
+        WGSL select(f, t, cond) returns t when cond is true, f when false —
+        the argument order is the reverse of Python's ternary, so we swap:
+            select(orelse, body, bool(test))
+        """
+        result_type = self.get_expr_type(node.body)
+        test  = self.translate_as(node.test, "bool")
+        body  = self.translate_as(node.body, result_type)
+        orelse = self.translate_as(node.orelse, result_type)
+        return f"select({orelse}, {body}, {test})"
+
     def visit_Compare(self, node: ast.Compare) -> str:
         lt = self.get_expr_type(node.left)
         rt = self.get_expr_type(node.comparators[0])

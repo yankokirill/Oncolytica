@@ -38,7 +38,7 @@ class CPUBackend:
         engine = self._engine
 
         # Clean up dead agents before processing
-        engine.cells.remove_dead()
+        engine.cells._remove_dead()
 
         # Set this backend as active for ol.neighbors() queries
         token = _active_backend.set(self)
@@ -132,3 +132,6 @@ class CPUBackend:
             )
             grid.setdefault(key, []).append(i)
         self._spatial_grid = grid
+
+
+# TODO: double buffering
